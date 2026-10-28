@@ -1,7 +1,7 @@
 {
   "name": "workpier",
   "productName": "WorkPier",
-  "version": "2.6.1",
+  "version": "2.7.0",
   "description": "网页工作台 — 多工作区聚合同类网页（云账号/iWiki/企微文档），每账号独立会话秒级切换",
   "author": "SirKayZh",
   "main": "dist/main.js",

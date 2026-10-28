@@ -9,6 +9,7 @@ import {
   dialog,
   crashReporter,
   clipboard,
+  shell as systemShell,
 } from 'electron';
 import type { Rectangle, WebContents, Session, MenuItemConstructorOptions } from 'electron';
 import * as path from 'node:path';
@@ -53,27 +54,81 @@ const SIDEBAR_W = 232;
 const RAIL_W = 88;
 /** Windows：自绘标题栏模式（titleBarStyle hidden + renderer 自绘最小化/最大化/关闭） */
 const IS_WIN = process.platform === 'win32';
-let sidebarCollapsed = false;
-function sidebarW(): number {
-  return sidebarCollapsed ? RAIL_W : SIDEBAR_W;
-}
 const TOPBAR_H = 52;
 const TABBAR_H = 36;
 /** 「保存登录信息」提示条 / 「恢复会话」横幅高度（与 index.html #banner 一致） */
 const BANNER_H = 56;
 
-let win: BrowserWindow | null = null;
-/** key: tabId —— 每个 tab 一个视图；同账号的所有 tab 共享同一 partition（登录态） */
-const views = new Map<string, WebContentsView>();
+interface BerthAnchor {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** 一个窗口里某账号的标签。主窗口不单独存，直接用账号上的 tabs。 */
+interface TabBag {
+  tabs: Tab[];
+  activeTabId: string | null;
+}
+
+/**
+ * 一个软件窗口。
+ * 网页视图只能挂在一个窗口上，所以每个窗口自己持有视图和标签；
+ * 账号、Cookie、密码库仍然全局共用（同一账号在两个窗口里都是登录态）。
+ */
+interface Shell {
+  win: BrowserWindow;
+  /** 第一个窗口。它的标签写在账号上，退出后还能恢复。后开的窗口各自记一份。 */
+  primary: boolean;
+  activeId: string | null;
+  activeBerthId: string;
+  berthActive: Record<string, string>;
+  sidebarCollapsed: boolean;
+  localTabs: Map<string, TabBag>;
+  views: Map<string, WebContentsView>;
+  berthOverlay: WebContentsView | null;
+  berthOverlayOpen: boolean;
+  berthOverlayAnchor: BerthAnchor;
+  findbar: WebContentsView | null;
+  findbarOpen: boolean;
+  findText: string;
+  /** 新窗口第一次显示时要打开的账号；主窗口不用 */
+  bootAccountId: string | null;
+  /** 新窗口第一张标签的地址。空串 = 起始页 */
+  bootUrl: string;
+}
+
+const shells: Shell[] = [];
+
+/** 窗口创建前从 ui.json 读入的记忆。主窗口起来之后以窗口上的值为准。 */
+let bootSidebarCollapsed = false;
+let bootBerthId = DEFAULT_BERTH_ID;
+let bootBerthActive: Record<string, string> = {};
+
+function aliveShells(): Shell[] {
+  return shells.filter((s) => !s.win.isDestroyed());
+}
+
+function primaryShell(): Shell | null {
+  return aliveShells().find((s) => s.primary) ?? null;
+}
+
+/** 菜单快捷键、程序坞动作：落在当前最前的窗口；没有焦点时用主窗口 */
+function focusedShell(): Shell | null {
+  const focused = BrowserWindow.getFocusedWindow();
+  if (focused) {
+    const hit = shells.find((s) => s.win === focused && !s.win.isDestroyed());
+    if (hit) return hit;
+  }
+  return primaryShell() ?? aliveShells()[0] ?? null;
+}
+
 let accounts: Account[] = [];
-let activeId: string | null = null;
 
 /* ---------- 工作区（Berth） ---------- */
 
 let berths: Berth[] = [];
-let activeBerthId = DEFAULT_BERTH_ID;
-/** 每个工作区记住上次活跃的账号：切回工作区时直接落回（不总是第一个） */
-let berthActive: Record<string, string> = {};
 
 function berthsFile(): string {
   return path.join(app.getPath('userData'), 'berths.json');
@@ -85,9 +140,9 @@ function berthIds(): Set<string> {
 }
 
 /** 当前工作区可见账号（sendState / ⌘1-9 / 菜单 / 预热的统一口径） */
-function visibleAccounts(): Account[] {
+function visibleAccounts(shell: Shell): Account[] {
   const ids = berthIds();
-  return accounts.filter((a) => berthOfAccount(a, ids) === activeBerthId);
+  return accounts.filter((a) => berthOfAccount(a, ids) === shell.activeBerthId);
 }
 
 function saveBerthsNow(): void {
@@ -115,7 +170,7 @@ function loadBerths(): void {
   }
   berths = loaded;
   const ids = berthIds();
-  if (!ids.has(activeBerthId)) activeBerthId = DEFAULT_BERTH_ID;
+  if (!ids.has(bootBerthId)) bootBerthId = DEFAULT_BERTH_ID;
   // 首启/损坏重建后立即落盘：berths.json 从第一次运行起就存在（否则不动工作区就永远不生成）
   if (fresh || !fs.existsSync(berthsFile())) saveBerthsNow();
 }
@@ -239,10 +294,21 @@ function writeFileAtomic(file: string, content: string, mode?: number): void {
 
 function saveUiNow(): void {
   try {
+    const p = primaryShell();
+    // 主窗口还没起来、或已经关掉：不要用空状态覆盖上次记住的账号
+    if (!p) return;
     const file = uiFile();
     fs.mkdirSync(path.dirname(file), { recursive: true });
     // activeId 为空时沿用已读到的上次值，避免只切侧边栏就丢了「上次账号」
-    writeFileAtomic(file, JSON.stringify({ activeId: activeId ?? savedActiveId, sidebarCollapsed, activeBerthId, berthActive }));
+    writeFileAtomic(
+      file,
+      JSON.stringify({
+        activeId: p.activeId ?? savedActiveId,
+        sidebarCollapsed: p.sidebarCollapsed,
+        activeBerthId: p.activeBerthId,
+        berthActive: p.berthActive,
+      }),
+    );
   } catch (err) {
     console.error('[workpier] save ui failed:', err);
   }
@@ -309,13 +375,13 @@ function loadAccounts(): void {
     const ui: unknown = JSON.parse(fs.readFileSync(uiFile(), 'utf-8'));
     const id = (ui as { activeId?: unknown }).activeId;
     savedActiveId = typeof id === 'string' ? id : null;
-    sidebarCollapsed = (ui as { sidebarCollapsed?: unknown }).sidebarCollapsed === true;
+    bootSidebarCollapsed = (ui as { sidebarCollapsed?: unknown }).sidebarCollapsed === true;
     const berth = (ui as { activeBerthId?: unknown }).activeBerthId;
-    if (typeof berth === 'string' && berth.length > 0) activeBerthId = berth;
+    if (typeof berth === 'string' && berth.length > 0) bootBerthId = berth;
     const mem = (ui as { berthActive?: unknown }).berthActive;
     if (mem && typeof mem === 'object' && !Array.isArray(mem)) {
       for (const [k, v] of Object.entries(mem as Record<string, unknown>)) {
-        if (typeof v === 'string') berthActive[k] = v;
+        if (typeof v === 'string') bootBerthActive[k] = v;
       }
     }
   } catch {
@@ -382,8 +448,42 @@ let loginHint: { accountId: string; tabId: string; label: string; host: string; 
  */
 const PENDING_TTL = 120_000;
 
-/** webContents.id -> 所属账号/标签（用于校验 IPC 发送方） */
-const wcMap = new Map<number, { acc: Account; tab: Tab }>();
+/** webContents.id -> 所属窗口/账号/标签（用于校验 IPC 发送方） */
+const wcMap = new Map<number, { shell: Shell; acc: Account; tab: Tab }>();
+
+function shellByWebContents(wc: WebContents): Shell | null {
+  for (const s of shells) {
+    if (s.win.isDestroyed()) continue;
+    if (s.win.webContents === wc) return s;
+    if (s.berthOverlay?.webContents === wc) return s;
+    if (s.findbar?.webContents === wc) return s;
+  }
+  return wcMap.get(wc.id)?.shell ?? null;
+}
+
+/** 这个窗口里该账号的标签袋。主窗口就是账号自己；后开的窗口单独一份。 */
+function bag(shell: Shell, acc: Account): TabBag {
+  if (shell.primary) return acc;
+  let local = shell.localTabs.get(acc.id);
+  if (!local) {
+    local = { tabs: [], activeTabId: null };
+    shell.localTabs.set(acc.id, local);
+  }
+  return local;
+}
+
+/** 发给界面的账号列表：后开的窗口换成自己的标签，不改账号磁盘数据 */
+function projectAccounts(shell: Shell): Account[] {
+  return visibleAccounts(shell).map((acc) => {
+    if (shell.primary) return acc;
+    const local = shell.localTabs.get(acc.id);
+    return { ...acc, tabs: local?.tabs ?? [], activeTabId: local?.activeTabId ?? null };
+  });
+}
+
+function sidebarW(shell: Shell): number {
+  return shell.sidebarCollapsed ? RAIL_W : SIDEBAR_W;
+}
 
 function credLabel(fields: string[]): string {
   return fields.filter(Boolean).join(' / ').slice(0, 120);
@@ -433,8 +533,8 @@ async function onCaptured(wcId: number, frameUrl: string | undefined, raw: unkno
     armed: false,
   });
   if (hadBanner) {
-    layoutViews();
-    sendState();
+    layoutAll();
+    sendStateAll();
   }
 }
 
@@ -465,9 +565,10 @@ function armPending(tabId: string): void {
   }
   hit.armed = true;
   hit.ts = Date.now();
-  if (win && !win.isFocused() && process.platform === 'darwin') app.dock?.bounce('informational');
-  layoutViews();
-  sendState();
+  const front = focusedShell();
+  if (front && !front.win.isFocused() && process.platform === 'darwin') app.dock?.bounce('informational');
+  layoutAll();
+  sendStateAll();
 }
 
 /** 页面还在输入（登录页 input 事件）：顺延等待窗口，覆盖滑块/短信二次验证这类耗时流程 */
@@ -496,7 +597,7 @@ function dropUnarmedPending(): void {
 function clearPending(accountId: string): void {
   const had = !!pendings.get(accountId)?.armed;
   pendings.delete(accountId);
-  if (had) layoutViews();
+  if (had) layoutAll();
 }
 
 function hostOf(origin: string): string {
@@ -507,8 +608,8 @@ function hostOf(origin: string): string {
   }
 }
 
-function pendingForUi(): PendingSave | null {
-  const p = activeId ? pendings.get(activeId) : undefined;
+function pendingForUi(shell: Shell): PendingSave | null {
+  const p = shell.activeId ? pendings.get(shell.activeId) : undefined;
   if (!p?.armed) return null;
   // 提示只属于当前账号：banner 上点「保存」落在哪个账号，以此处为准
   return {
@@ -527,8 +628,9 @@ function dropAccountCreds(id: string): void {
 
 async function deleteCredEntry(entryId: string): Promise<void> {
   const e = vault.entries.find((x) => x.id === entryId);
-  if (!e || !win) return;
-  const choice = await dialog.showMessageBox(win, {
+  const shell = focusedShell();
+  if (!e || !shell) return;
+  const choice = await dialog.showMessageBox(shell.win, {
     type: 'warning',
     buttons: ['删除', '取消'],
     defaultId: 1,
@@ -538,13 +640,14 @@ async function deleteCredEntry(entryId: string): Promise<void> {
   });
   if (choice.response !== 0) return;
   await vault.removeEntry(entryId);
-  sendState();
+  sendStateAll();
 }
 
 async function clearAccountCreds(accountId: string): Promise<void> {
   const acc = accounts.find((a) => a.id === accountId);
-  if (!acc || !win) return;
-  const choice = await dialog.showMessageBox(win, {
+  const shell = focusedShell();
+  if (!acc || !shell) return;
+  const choice = await dialog.showMessageBox(shell.win, {
     type: 'warning',
     buttons: ['全部清除', '取消'],
     defaultId: 1,
@@ -554,7 +657,7 @@ async function clearAccountCreds(accountId: string): Promise<void> {
   });
   if (choice.response !== 0) return;
   await vault.dropAccount(accountId);
-  sendState();
+  sendStateAll();
 }
 
 /* ---------- 账号 / 标签页模型 ---------- */
@@ -563,7 +666,7 @@ function newTabRecord(url = '', title = ''): Tab {
   return { id: randomBytes(6).toString('hex'), url, title };
 }
 
-/** 保证账号至少有一个 tab，且 activeTabId 有效（兼容 v1.0.0 旧数据迁移） */
+/** 保证账号磁盘数据至少有一个 tab，且 activeTabId 有效（兼容 v1.0.0 旧数据；窗口创建前也能用） */
 function ensureAccountTabs(acc: Account): void {
   if (!Array.isArray(acc.tabs)) acc.tabs = [];
   if (acc.tabs.length === 0) {
@@ -576,19 +679,40 @@ function ensureAccountTabs(acc: Account): void {
   }
 }
 
-function activeAccount(): Account | null {
-  return accounts.find((a) => a.id === activeId) ?? null;
+/** 保证这个窗口里该账号至少有一个 tab。主窗口改账号本身；后开的窗口只改自己的那份。 */
+function ensureTabs(shell: Shell, acc: Account): void {
+  if (shell.primary) {
+    ensureAccountTabs(acc);
+    return;
+  }
+  const b = bag(shell, acc);
+  if (b.tabs.length === 0) {
+    const home = acc.home && isHttpUrl(acc.home) ? acc.home : '';
+    const t = newTabRecord(home);
+    b.tabs.push(t);
+    b.activeTabId = t.id;
+  }
+  if (!b.tabs.some((t) => t.id === b.activeTabId)) {
+    b.activeTabId = b.tabs[0].id;
+  }
 }
 
-function activeTab(): Tab | null {
-  const acc = activeAccount();
+function activeAccount(shell: Shell): Account | null {
+  return accounts.find((a) => a.id === shell.activeId) ?? null;
+}
+
+function activeTab(shell: Shell): Tab | null {
+  const acc = activeAccount(shell);
   if (!acc) return null;
-  return acc.tabs.find((t) => t.id === acc.activeTabId) ?? null;
+  const b = shell.primary ? acc : shell.localTabs.get(acc.id);
+  if (!b) return null;
+  return b.tabs.find((t) => t.id === b.activeTabId) ?? null;
 }
 
-function findAccountByTab(tabId: string): { acc: Account; tab: Tab } | null {
+function findTab(shell: Shell, tabId: string): { acc: Account; tab: Tab } | null {
   for (const acc of accounts) {
-    const tab = acc.tabs.find((t) => t.id === tabId);
+    const tabs = shell.primary ? acc.tabs : shell.localTabs.get(acc.id)?.tabs;
+    const tab = tabs?.find((t) => t.id === tabId);
     if (tab) return { acc, tab };
   }
   return null;
@@ -626,7 +750,7 @@ function applyAutoName(acc: Account, source: keyof typeof NAME_RANK, name: strin
   acc.note = finalNote;
   acc.nameSource = source;
   scheduleSave();
-  sendState();
+  sendStateAll();
 }
 
 /** 主窗口首次导航到真实网站：记录账号首页，并用站点名兜底命名 */
@@ -746,9 +870,10 @@ function applyPermissionPolicy(ses: Session): void {
     // 摄像头/麦克风：弹框确认。静默放行等于对全网无条件开放，风险过高。
     if (permission === 'media') {
       const host = hostnameOf(wc.getURL());
-      if (!win || win.isDestroyed()) return callback(false);
+      const shell = shellByWebContents(wc) ?? focusedShell();
+      if (!shell || shell.win.isDestroyed()) return callback(false);
       void dialog
-        .showMessageBox(win, {
+        .showMessageBox(shell.win, {
           type: 'question',
           buttons: ['允许', '拒绝'],
           defaultId: 1,
@@ -773,54 +898,69 @@ function applyPermissionPolicy(ses: Session): void {
 
 /* ---------- 布局 ---------- */
 
-function viewBounds(): Rectangle {
-  if (!win) return { x: 0, y: 0, width: 0, height: 0 };
-  const [cw, ch] = win.getContentSize();
-  // 「保存密码」提示条与「恢复会话」横幅等高，同一段时间最多显示一个
-  const hasBanner = pendingForUi() !== null || crashRecoveryPending;
+function viewBounds(shell: Shell): Rectangle {
+  if (shell.win.isDestroyed()) return { x: 0, y: 0, width: 0, height: 0 };
+  const [cw, ch] = shell.win.getContentSize();
+  // 「保存密码」提示条与「恢复会话」横幅等高，同一段时间最多显示一个。崩溃横幅只在主窗口。
+  const hasBanner = pendingForUi(shell) !== null || (shell.primary && crashRecoveryPending);
   const top = TOPBAR_H + TABBAR_H + (hasBanner ? BANNER_H : 0);
+  const side = sidebarW(shell);
   return {
-    x: sidebarW(),
+    x: side,
     y: top,
-    width: Math.max(0, cw - sidebarW()),
+    width: Math.max(0, cw - side),
     height: Math.max(0, ch - top),
   };
 }
 
-function layoutViews(): void {
-  const b = viewBounds();
-  for (const view of views.values()) view.setBounds(b);
-  if (berthOverlayOpen && berthOverlay) berthOverlay.setBounds(overlayBounds());
-  if (findbarOpen && findbar) findbar.setBounds(findbarAnchor(b, FINDBAR_W, FINDBAR_H, FINDBAR_MARGIN));
+function layoutViews(shell: Shell): void {
+  if (shell.win.isDestroyed()) return;
+  const b = viewBounds(shell);
+  for (const view of shell.views.values()) view.setBounds(b);
+  if (shell.berthOverlayOpen && shell.berthOverlay) shell.berthOverlay.setBounds(overlayBounds(shell));
+  if (shell.findbarOpen && shell.findbar) {
+    shell.findbar.setBounds(findbarAnchor(b, FINDBAR_W, FINDBAR_H, FINDBAR_MARGIN));
+  }
 }
 
-function activeWc(): WebContents | null {
-  const tab = activeTab();
+function layoutAll(): void {
+  for (const s of aliveShells()) layoutViews(s);
+}
+
+function activeWc(shell: Shell): WebContents | null {
+  const tab = activeTab(shell);
   if (!tab) return null;
-  return views.get(tab.id)?.webContents ?? null;
+  return shell.views.get(tab.id)?.webContents ?? null;
 }
 
-function sendState(): void {
-  if (!win || win.isDestroyed()) return;
-  const tab = activeTab();
-  const wc = tab ? views.get(tab.id)?.webContents : undefined;
+function sendState(shell: Shell): void {
+  if (shell.win.isDestroyed()) return;
+  const tab = activeTab(shell);
+  const wc = tab ? shell.views.get(tab.id)?.webContents : undefined;
+  const acc = activeAccount(shell);
+  const title = acc ? `WorkPier — ${acc.name}` : 'WorkPier — 网页工作台';
+  if (shell.win.getTitle() !== title) shell.win.setTitle(title);
   const state: AppState = {
-    accounts: visibleAccounts(),
+    accounts: projectAccounts(shell),
     berths,
-    activeBerthId,
-    activeId,
+    activeBerthId: shell.activeBerthId,
+    activeId: shell.activeId,
     activeTabId: tab?.id ?? null,
     url: wc ? (isHttpUrl(wc.getURL()) ? wc.getURL() : '') : tab?.url ?? '',
     title: wc ? wc.getTitle() : tab?.title ?? '',
     canGoBack: wc ? wc.navigationHistory.canGoBack() : false,
     canGoForward: wc ? wc.navigationHistory.canGoForward() : false,
     isLoading: wc ? wc.isLoading() : false,
-    pending: pendingForUi(),
-    sidebarCollapsed,
-    crashRecovery: crashRecoveryPending,
+    pending: pendingForUi(shell),
+    sidebarCollapsed: shell.sidebarCollapsed,
+    crashRecovery: shell.primary && crashRecoveryPending,
   };
   refreshMenuIfNeeded();
-  win.webContents.send('state:update', state);
+  shell.win.webContents.send('state:update', state);
+}
+
+function sendStateAll(): void {
+  for (const s of aliveShells()) sendState(s);
 }
 
 /* ---------- 标签页视图 ---------- */
@@ -832,7 +972,7 @@ const PREWARM_MAX = 4;
 /** 跨区预热上限：其他工作区「上次活跃账号」各预热 1 个视图（切区零冷启动） */
 const PREWARM_BERTHS_MAX = 6;
 
-function createTabView(acc: Account, tab: Tab, prewarm = false): WebContentsView {
+function createTabView(shell: Shell, acc: Account, tab: Tab, prewarm = false): WebContentsView {
   const ses = session.fromPartition(`persist:clouddock-${acc.id}`);
   // 去掉 UA 中的 Electron 标识，避免登录链路 UA 校验问题
   const ua = ses.getUserAgent().replace(/Electron\/[\d.]+\s*/i, '');
@@ -853,17 +993,17 @@ function createTabView(acc: Account, tab: Tab, prewarm = false): WebContentsView
     },
   });
   const wc = view.webContents;
-  wcMap.set(wc.id, { acc, tab });
+  wcMap.set(wc.id, { shell, acc, tab });
 
-  // target=_blank / window.open：在【同一账号】内开新标签，共享登录态。
+  // target=_blank / window.open：在【同一窗口、同一账号】内开新标签，共享登录态。
   // 若交给系统浏览器，会丢失该账号的会话（落到别的账号或未登录）。
   wc.setWindowOpenHandler(({ url, disposition }) => {
     if (/^https?:/i.test(url)) {
-      const isCurrent = activeId === acc.id && acc.activeTabId === tab.id;
+      const isCurrent = shell.activeId === acc.id && bag(shell, acc).activeTabId === tab.id;
       const activate = disposition !== 'background-tab' && isCurrent;
       // 异步执行，避免在 handler 回调里同步改动视图
       setImmediate(() => {
-        if (accounts.includes(acc)) newTabForAccount(acc, url, activate);
+        if (accounts.includes(acc) && !shell.win.isDestroyed()) newTabForAccount(shell, acc, url, activate);
       });
     } else if (url === 'about:blank') {
       // 部分 OAuth/支付流程先 window.open('about:blank') 再往里跳转；
@@ -873,7 +1013,7 @@ function createTabView(acc: Account, tab: Tab, prewarm = false): WebContentsView
         overrideBrowserWindowOptions: { width: 980, height: 680, autoHideMenuBar: true },
       };
     } else if (/^mailto:/i.test(url)) {
-      void shell.openExternal(url);
+      void systemShell.openExternal(url);
     }
     return { action: 'deny' };
   });
@@ -881,7 +1021,7 @@ function createTabView(acc: Account, tab: Tab, prewarm = false): WebContentsView
   // 网页右键菜单：Electron 不内置 Chromium 的右键菜单（context-menu 事件只触发不展示），
   // 需应用自行构建并 popup；坐标是页面内坐标，popup 需要相对窗口的坐标（加上视图偏移）。
   wc.on('context-menu', (_e, params) => {
-    if (!win || win.isDestroyed()) return;
+    if (shell.win.isDestroyed()) return;
     const items: MenuItemConstructorOptions[] = [];
 
     if (params.linkURL && isHttpUrl(params.linkURL)) {
@@ -890,10 +1030,10 @@ function createTabView(acc: Account, tab: Tab, prewarm = false): WebContentsView
           label: '在新标签页打开链接',
           click: () => {
             if (wc.isDestroyed() || !accounts.includes(acc)) return;
-            newTabForAccount(acc, params.linkURL, activeId === acc.id);
+            newTabForAccount(shell, acc, params.linkURL, shell.activeId === acc.id);
           },
         },
-        { label: '在系统浏览器中打开链接', click: () => void shell.openExternal(params.linkURL) },
+        { label: '在系统浏览器中打开链接', click: () => void systemShell.openExternal(params.linkURL) },
         { label: '复制链接地址', click: () => clipboard.writeText(params.linkURL) },
         { type: 'separator' },
       );
@@ -932,7 +1072,7 @@ function createTabView(acc: Account, tab: Tab, prewarm = false): WebContentsView
     if (isHttpUrl(pageUrl)) {
       items.push(
         { type: 'separator' },
-        { label: '在系统浏览器中打开当前页', click: () => void shell.openExternal(pageUrl) },
+        { label: '在系统浏览器中打开当前页', click: () => void systemShell.openExternal(pageUrl) },
       );
     }
     items.push(
@@ -941,38 +1081,38 @@ function createTabView(acc: Account, tab: Tab, prewarm = false): WebContentsView
     );
 
     const b = view.getBounds();
-    Menu.buildFromTemplate(items).popup({ window: win, x: b.x + params.x, y: b.y + params.y });
+    Menu.buildFromTemplate(items).popup({ window: shell.win, x: b.x + params.x, y: b.y + params.y });
   });
 
   // ⌘1~⌘9 切换账号（仅当前工作区内的序号；其余按键交给应用菜单）
   wc.on('before-input-event', (event, input) => {
     if (input.type !== 'keyDown') return;
     // 搜索栏打开期间，焦点回到网页后按 Esc 也要能关掉它（Chrome 行为）
-    if (findbarOpen && input.key === 'Escape') {
+    if (shell.findbarOpen && input.key === 'Escape') {
       event.preventDefault();
-      closeFindbar();
+      closeFindbar(shell);
       return;
     }
     if (!input.meta) return;
     const m = /^Digit([1-9])$/.exec(input.code);
     if (m) {
-      const target = visibleAccounts()[Number(m[1]) - 1];
+      const target = visibleAccounts(shell)[Number(m[1]) - 1];
       if (target) {
         event.preventDefault();
-        switchAccount(target.id);
+        switchAccount(shell, target.id);
       }
     }
   });
 
   // findInPage 的匹配进度（当前第几个/共几个）实时转发给搜索栏
   wc.on('found-in-page', (_e, r) => {
-    if (!findbarOpen || activeWc()?.id !== wc.id) return;
-    sendFindMatches(r.activeMatchOrdinal, r.matches);
+    if (!shell.findbarOpen || activeWc(shell)?.id !== wc.id) return;
+    sendFindMatches(shell, r.activeMatchOrdinal, r.matches);
   });
 
   // 同账号下任一 tab（含后台 tab）的标题/加载状态变化都需要刷新标签栏
   const refresh = (): void => {
-    if (activeId === acc.id) sendState();
+    if (shell.activeId === acc.id) sendState(shell);
   };
 
   // 渲染进程崩溃自动恢复（连续崩溃 3 次后放弃，避免死循环）
@@ -1010,7 +1150,7 @@ function createTabView(acc: Account, tab: Tab, prewarm = false): WebContentsView
   };
   // 导航后旧高亮已随文档销毁：搜索栏开着且有词时，在新文档里自动重查（Chrome 行为）
   const refindAfterNav = (): void => {
-    if (findbarOpen && findText && activeWc()?.id === wc.id) runFind(findText, true, false);
+    if (shell.findbarOpen && shell.findText && activeWc(shell)?.id === wc.id) runFind(shell, shell.findText, true, false);
   };
   wc.on('did-navigate', () => {
     syncUrl();
@@ -1037,12 +1177,12 @@ function createTabView(acc: Account, tab: Tab, prewarm = false): WebContentsView
     refresh();
   });
 
-  views.set(tab.id, view);
-  if (win) {
-    win.contentView.addChildView(view);
-    if (findbarOpen && findbar) win.contentView.addChildView(findbar); // 搜索栏保持在网页之上
-    if (berthOverlayOpen && berthOverlay) win.contentView.addChildView(berthOverlay); // 浮层始终最顶
-    view.setBounds(viewBounds());
+  shell.views.set(tab.id, view);
+  if (!shell.win.isDestroyed()) {
+    shell.win.contentView.addChildView(view);
+    if (shell.findbarOpen && shell.findbar) shell.win.contentView.addChildView(shell.findbar); // 搜索栏保持在网页之上
+    if (shell.berthOverlayOpen && shell.berthOverlay) shell.win.contentView.addChildView(shell.berthOverlay); // 浮层始终最顶
+    view.setBounds(viewBounds(shell));
     view.setVisible(false);
   }
   if (prewarm) {
@@ -1062,26 +1202,41 @@ function safeLoad(wc: WebContents, url: string): void {
   });
 }
 
-function ensureTabView(acc: Account, tab: Tab): WebContentsView {
-  return views.get(tab.id) ?? createTabView(acc, tab);
+function ensureTabView(shell: Shell, acc: Account, tab: Tab): WebContentsView {
+  return shell.views.get(tab.id) ?? createTabView(shell, acc, tab);
 }
 
-function destroyTabView(tabId: string): void {
-  const view = views.get(tabId);
+function destroyTabView(shell: Shell, tabId: string): void {
+  const view = shell.views.get(tabId);
   if (!view) return;
-  if (win) win.contentView.removeChildView(view);
-  views.delete(tabId);
+  if (!shell.win.isDestroyed()) {
+    try {
+      shell.win.contentView.removeChildView(view);
+    } catch {
+      /* 窗口正在关掉 */
+    }
+  }
+  shell.views.delete(tabId);
   prewarmedTabs.delete(tabId);
   wcMap.delete(view.webContents.id);
   const p = findUnarmedByTab(tabId);
   if (p) pendings.delete(p.accountId);
   if (loginHint?.tabId === tabId) loginHint = null;
-  view.webContents.close();
+  if (!view.webContents.isDestroyed()) view.webContents.close();
 }
 
-/** 只显示指定 tab 的视图，其余全部隐藏 */
-function showOnly(tabId: string): void {
-  for (const [vid, v] of views) v.setVisible(vid === tabId);
+/** 关掉某账号在所有窗口里的网页视图（账号删除 / 清标签时） */
+function destroyAccountViews(acc: Account): void {
+  for (const s of shells) {
+    const tabs = s.primary ? acc.tabs : (s.localTabs.get(acc.id)?.tabs ?? []);
+    for (const t of [...tabs]) destroyTabView(s, t.id);
+    s.localTabs.delete(acc.id);
+  }
+}
+
+/** 只显示本窗口里指定 tab 的视图，其余隐藏。别的窗口不动。 */
+function showOnly(shell: Shell, tabId: string): void {
+  for (const [vid, v] of shell.views) v.setVisible(vid === tabId);
 }
 
 /* ---------- 切换 ---------- */
@@ -1100,13 +1255,14 @@ const SPARE_MAX = 3;
 const spareByAccount = new Map<string, Tab>();
 
 function makeSpareView(acc: Account): void {
-  if (!win || win.isDestroyed()) return;
+  const shell = primaryShell();
+  if (!shell) return;
   if (spareByAccount.has(acc.id)) return;
   if (spareByAccount.size >= SPARE_MAX) return;
   if (!accounts.includes(acc)) return;
   const t = newTabRecord('');
   spareByAccount.set(acc.id, t);
-  createTabView(acc, t, true);
+  createTabView(shell, acc, t, true);
 }
 
 /** 销毁某账号的 spare（账号删除等场景，防止孤儿渲染进程） */
@@ -1114,145 +1270,143 @@ function destroySpare(accountId: string): void {
   const spare = spareByAccount.get(accountId);
   if (!spare) return;
   spareByAccount.delete(accountId);
-  destroyTabView(spare.id);
+  for (const s of shells) {
+    if (s.views.has(spare.id)) destroyTabView(s, spare.id);
+  }
 }
 
-function switchTab(tabId: string): boolean {
-  const found = findAccountByTab(tabId);
-  if (!found || !win) return false;
+function switchTab(shell: Shell, tabId: string): boolean {
+  const found = findTab(shell, tabId);
+  if (!found || shell.win.isDestroyed()) return false;
   const { acc, tab } = found;
-  acc.activeTabId = tabId;
-  activeId = acc.id;
-  const view = ensureTabView(acc, tab);
+  bag(shell, acc).activeTabId = tabId;
+  shell.activeId = acc.id;
+  const view = ensureTabView(shell, acc, tab);
   if (prewarmedTabs.delete(tab.id)) {
     // 预热视图首次转正：渲染进程已在，只需导航到目标地址（Chrome Aperitif 的切换提速收益点）
     safeLoad(view.webContents, isHttpUrl(tab.url) ? tab.url : startUrl());
   }
-  showOnly(tabId);
-  view.setBounds(viewBounds());
+  showOnly(shell, tabId);
+  view.setBounds(viewBounds(shell));
   view.webContents.focus();
-  retargetFindbar();
-  scheduleSave();
-  sendState();
+  retargetFindbar(shell);
+  if (shell.primary) scheduleSave();
+  sendState(shell);
   return true;
 }
 
-function switchAccount(id: string): boolean {
+function switchAccount(shell: Shell, id: string): boolean {
   const acc = accounts.find((a) => a.id === id);
   if (!acc) return false;
-  ensureAccountTabs(acc);
-  const tabId = acc.activeTabId;
+  ensureTabs(shell, acc);
+  const tabId = bag(shell, acc).activeTabId;
   if (!tabId) return false;
-  // 切换后为新活跃账号补 spare（延迟执行，不与切换导航抢资源）
-  schedulePrewarm(5_000);
-  return switchTab(tabId);
+  // 切换后为新活跃账号补 spare（延迟执行，不与切换导航抢资源）。后开的窗口不养 spare。
+  if (shell.primary) schedulePrewarm(5_000);
+  return switchTab(shell, tabId);
 }
 
 /**
  * 切换工作区：记住当前区活跃账号 → 换区 → 落到该区上次活跃账号（或第一个）。
- * 账号/视图不销毁（与切换账号同语义：隐藏不关闭），各工作区登录态、标签页原地保留。
+ * 只影响这一个窗口。账号/视图不销毁，各工作区登录态、标签页原地保留。
  */
-function switchBerth(id: string): boolean {
+function switchBerth(shell: Shell, id: string): boolean {
   if (!berths.some((b) => b.id === id)) return false;
-  if (id === activeBerthId) return true;
-  // 记住当前区的活跃账号（切回时直接落回）
-  if (activeId) berthActive[activeBerthId] = activeId;
-  activeBerthId = id;
-  const vis = visibleAccounts();
-  const target = vis.find((a) => a.id === berthActive[id]) ?? vis[0] ?? null;
+  if (id === shell.activeBerthId) return true;
+  if (shell.activeId) shell.berthActive[shell.activeBerthId] = shell.activeId;
+  shell.activeBerthId = id;
+  const vis = visibleAccounts(shell);
+  const target = vis.find((a) => a.id === shell.berthActive[id]) ?? vis[0] ?? null;
   if (target) {
-    switchAccount(target.id);
+    switchAccount(shell, target.id);
   } else {
-    // 空工作区：不显示任何账号（empty 状态），已有视图保持隐藏
-    activeId = null;
-    closeFindbar(); // 没有网页可搜，搜索栏一并收起
-    sendState();
+    shell.activeId = null;
+    closeFindbar(shell);
+    sendState(shell);
   }
-  scheduleUiSave(); // 热路径去抖落盘，不同步写盘
-  schedulePrewarm(3_000);
+  if (shell.primary) {
+    scheduleUiSave();
+    schedulePrewarm(3_000);
+  }
   return true;
 }
 
 /* ---------- 标签页操作 ---------- */
 
-function newTabForAccount(acc: Account, url?: string, activate = true): Tab {
-  ensureAccountTabs(acc);
+function newTabForAccount(shell: Shell, acc: Account, url?: string, activate = true): Tab {
+  if (shell.primary) ensureAccountTabs(acc);
+  const b = bag(shell, acc);
   const httpUrl = url && /^https?:/i.test(url) ? url : '';
   let t: Tab;
-  if (activate) {
-    // 优先转正 spare：渲染进程已就绪，switchTab 只剩导航时间
+  if (activate && shell.primary) {
+    // 优先转正 spare：渲染进程已就绪，switchTab 只剩导航时间。后开的窗口没有 spare。
     const spare = spareByAccount.get(acc.id) ?? null;
     spareByAccount.delete(acc.id);
-    if (spare && prewarmedTabs.has(spare.id) && views.has(spare.id)) {
+    if (spare && prewarmedTabs.has(spare.id) && shell.views.has(spare.id)) {
       t = spare;
       t.url = httpUrl;
-      acc.tabs.push(t);
-      // 消费后尽快补位（延迟执行，不与本次导航抢资源）
+      b.tabs.push(t);
       schedulePrewarm(3_000);
     } else {
-      if (spare) destroyTabView(spare.id); // 视图已失效（如被崩溃清理），不挂孤儿
+      if (spare) destroyTabView(shell, spare.id);
       t = newTabRecord(httpUrl);
-      acc.tabs.push(t);
+      b.tabs.push(t);
     }
   } else {
-    // 后台标签：只记录，视图在首次激活时懒创建（保持原语义，不用 spare）
     t = newTabRecord(httpUrl);
-    acc.tabs.push(t);
+    b.tabs.push(t);
   }
   if (activate) {
-    acc.activeTabId = t.id;
-    switchTab(t.id);
+    b.activeTabId = t.id;
+    switchTab(shell, t.id);
   } else {
-    // 后台标签：只记录，视图在首次激活时懒创建
-    scheduleSave();
-    if (activeId === acc.id) sendState();
+    if (shell.primary) scheduleSave();
+    if (shell.activeId === acc.id) sendState(shell);
   }
   return t;
 }
 
-function closeTab(tabId: string): boolean {
-  const found = findAccountByTab(tabId);
+function closeTab(shell: Shell, tabId: string): boolean {
+  const found = findTab(shell, tabId);
   if (!found) return false;
   const { acc, tab } = found;
-  const idx = acc.tabs.findIndex((t) => t.id === tab.id);
+  const b = bag(shell, acc);
+  const idx = b.tabs.findIndex((t) => t.id === tab.id);
   if (idx < 0) return false;
-  acc.tabs.splice(idx, 1);
-  destroyTabView(tab.id);
-  // 关掉最后一个 tab 时，自动补一个首页 tab（账号保持）
-  if (acc.tabs.length === 0) {
+  b.tabs.splice(idx, 1);
+  destroyTabView(shell, tab.id);
+  if (b.tabs.length === 0) {
     const t = newTabRecord();
-    acc.tabs.push(t);
-    acc.activeTabId = t.id;
-  } else if (acc.activeTabId === tab.id) {
-    acc.activeTabId = acc.tabs[Math.min(idx, acc.tabs.length - 1)].id;
+    b.tabs.push(t);
+    b.activeTabId = t.id;
+  } else if (b.activeTabId === tab.id) {
+    b.activeTabId = b.tabs[Math.min(idx, b.tabs.length - 1)].id;
   }
-  if (activeId === acc.id) {
-    const next = acc.activeTabId;
-    if (next) switchTab(next);
-  }
-  scheduleSave();
-  sendState();
+  if (shell.activeId === acc.id && b.activeTabId) switchTab(shell, b.activeTabId);
+  if (shell.primary) scheduleSave();
+  sendState(shell);
   return true;
 }
 
-function cycleTab(delta: number): void {
-  const acc = activeAccount();
+function cycleTab(shell: Shell, delta: number): void {
+  const acc = activeAccount(shell);
   if (!acc) return;
-  ensureAccountTabs(acc);
-  const idx = acc.tabs.findIndex((t) => t.id === acc.activeTabId);
-  const next = acc.tabs[(idx + delta + acc.tabs.length) % acc.tabs.length];
-  if (next) switchTab(next.id);
+  ensureTabs(shell, acc);
+  const b = bag(shell, acc);
+  const idx = b.tabs.findIndex((t) => t.id === b.activeTabId);
+  const next = b.tabs[(idx + delta + b.tabs.length) % b.tabs.length];
+  if (next) switchTab(shell, next.id);
 }
 
 /* ---------- 侧边栏收起 / 展开 ---------- */
 
-function setSidebarCollapsed(next: boolean): void {
-  if (sidebarCollapsed === next) return;
-  closeBerthOverlay(); // 触发器位置会变，浮层锚点作废
-  sidebarCollapsed = next;
-  scheduleUiSave();
-  layoutViews();
-  sendState();
+function setSidebarCollapsed(shell: Shell, next: boolean): void {
+  if (shell.sidebarCollapsed === next) return;
+  closeBerthOverlay(shell);
+  shell.sidebarCollapsed = next;
+  if (shell.primary) scheduleUiSave();
+  layoutViews(shell);
+  sendState(shell);
 }
 
 /* ---------- 清除 Cookie ---------- */
@@ -1268,11 +1422,12 @@ function accountSession(acc: Account): Session {
   return session.fromPartition(`persist:clouddock-${acc.id}`);
 }
 
-/** 账号当前标签页所在网站的主机名（起始页/非网页返回空串） */
-function currentHost(acc: Account): string {
-  const tab = acc.tabs.find((t) => t.id === acc.activeTabId);
+/** 这个窗口里，该账号当前标签页所在网站的主机名（起始页/非网页返回空串） */
+function currentHost(shell: Shell, acc: Account): string {
+  const b = shell.primary ? acc : shell.localTabs.get(acc.id);
+  const tab = b?.tabs.find((t) => t.id === b.activeTabId);
   if (!tab) return '';
-  const wcUrl = views.get(tab.id)?.webContents.getURL();
+  const wcUrl = shell.views.get(tab.id)?.webContents.getURL();
   const url = isHttpUrl(wcUrl) ? wcUrl : tab.url;
   try {
     return isHttpUrl(url) ? new URL(url).hostname.toLowerCase() : '';
@@ -1295,12 +1450,12 @@ async function cookiesFor(ses: Session, host: string | null): Promise<Electron.C
   });
 }
 
-async function clearAccountData(acc: Account, scope: ClearScope): Promise<boolean> {
-  if (!win || !accounts.includes(acc)) return false;
+async function clearAccountData(shell: Shell, acc: Account, scope: ClearScope): Promise<boolean> {
+  if (shell.win.isDestroyed() || !accounts.includes(acc)) return false;
   const ses = accountSession(acc);
-  const host = scope === 'site' ? currentHost(acc) : null;
+  const host = scope === 'site' ? currentHost(shell, acc) : null;
   if (scope === 'site' && !host) {
-    await dialog.showMessageBox(win, {
+    await dialog.showMessageBox(shell.win, {
       type: 'info',
       buttons: ['好'],
       message: '当前标签页不是网站页面',
@@ -1319,7 +1474,7 @@ async function clearAccountData(acc: Account, scope: ClearScope): Promise<boolea
     scope === 'all'
       ? `将清除该账号所有网站的 Cookie（共 ${count} 条）、缓存、本地存储，所有网站需重新登录。账号本身和已保存的密码保留。`
       : `共 ${count} 条 Cookie。清除后${scope === 'site' ? '该网站' : '所有网站'}会退出登录，需重新登录。账号本身和已保存的密码保留。`;
-  const choice = await dialog.showMessageBox(win, {
+  const choice = await dialog.showMessageBox(shell.win, {
     type: 'warning',
     buttons: ['清除', '取消'],
     defaultId: 1,
@@ -1351,21 +1506,31 @@ async function clearAccountData(acc: Account, scope: ClearScope): Promise<boolea
     delete acc.uin;
     delete acc.ownerUin;
   }
-  for (const t of acc.tabs) {
-    if (prewarmedTabs.has(t.id)) continue; // 预热视图没载真实页面，无需重载
-    views.get(t.id)?.webContents.reload();
-  }
+  reloadAccountPages(acc);
   scheduleSave();
-  sendState();
+  sendStateAll();
   return true;
+}
+
+/** 这个账号在各个窗口里已经打开的页面都刷新（清 Cookie 之后） */
+function reloadAccountPages(acc: Account): void {
+  for (const s of aliveShells()) {
+    const tabs = s.primary ? acc.tabs : (s.localTabs.get(acc.id)?.tabs ?? []);
+    for (const t of tabs) {
+      if (prewarmedTabs.has(t.id)) continue;
+      const view = s.views.get(t.id);
+      if (view && !view.webContents.isDestroyed()) view.webContents.reload();
+    }
+  }
 }
 
 /** 清除所有账号的 Cookie（一次确认） */
 async function clearAllAccountsCookies(): Promise<boolean> {
-  if (!win || accounts.length === 0) return false;
+  const shell = focusedShell();
+  if (!shell || accounts.length === 0) return false;
   let total = 0;
   for (const a of accounts) total += (await cookiesFor(accountSession(a), null)).length;
-  const choice = await dialog.showMessageBox(win, {
+  const choice = await dialog.showMessageBox(shell.win, {
     type: 'warning',
     buttons: ['清除', '取消'],
     defaultId: 1,
@@ -1385,38 +1550,35 @@ async function clearAllAccountsCookies(): Promise<boolean> {
     }
     delete a.uin;
     delete a.ownerUin;
-    for (const t of a.tabs) {
-      if (prewarmedTabs.has(t.id)) continue;
-      views.get(t.id)?.webContents.reload();
-    }
+    reloadAccountPages(a);
   }
   scheduleSave();
-  sendState();
+  sendStateAll();
   return true;
 }
 
 /** 清除 Cookie 的三个菜单项（右键菜单与「账号」菜单共用） */
-function cookieMenuItems(acc: Account): MenuItemConstructorOptions[] {
+function cookieMenuItems(shell: Shell, acc: Account): MenuItemConstructorOptions[] {
   return [
-    { label: '清除 Cookie（退出该账号所有网站登录）…', click: () => void clearAccountData(acc, 'cookies') },
-    { label: '清除当前网站的 Cookie…', click: () => void clearAccountData(acc, 'site') },
-    { label: '清除全部站点数据（Cookie、缓存、本地存储）…', click: () => void clearAccountData(acc, 'all') },
+    { label: '清除 Cookie（退出该账号所有网站登录）…', click: () => void clearAccountData(shell, acc, 'cookies') },
+    { label: '清除当前网站的 Cookie…', click: () => void clearAccountData(shell, acc, 'site') },
+    { label: '清除全部站点数据（Cookie、缓存、本地存储）…', click: () => void clearAccountData(shell, acc, 'all') },
   ];
 }
 
-function requestRename(id: string): void {
-  if (!win || win.isDestroyed()) return;
-  win.webContents.focus();
-  win.webContents.send('rename:start', id);
+function requestRename(shell: Shell, id: string): void {
+  if (shell.win.isDestroyed()) return;
+  shell.win.webContents.focus();
+  shell.win.webContents.send('rename:start', id);
 }
 
 /* ---------- 删除账号 ---------- */
 
-async function removeAccount(id: string): Promise<boolean> {
+async function removeAccount(shell: Shell, id: string): Promise<boolean> {
   const idx = accounts.findIndex((a) => a.id === id);
-  if (idx < 0 || !win) return false;
+  if (idx < 0 || shell.win.isDestroyed()) return false;
   const acc = accounts[idx];
-  const choice = await dialog.showMessageBox(win, {
+  const choice = await dialog.showMessageBox(shell.win, {
     type: 'warning',
     buttons: ['删除', '取消'],
     defaultId: 1,
@@ -1426,33 +1588,28 @@ async function removeAccount(id: string): Promise<boolean> {
   });
   if (choice.response !== 0) return false;
 
-  // 对话框期间 accounts 可能已变化，重新定位而不是用旧下标
   const cur = accounts.indexOf(acc);
   if (cur < 0) return false;
+  destroyAccountViews(acc);
+  destroySpare(id);
   accounts.splice(cur, 1);
-  for (const t of acc.tabs) destroyTabView(t.id);
-  destroySpare(id); // spare 的 Tab 不在 acc.tabs 里，需单独清理
   dropAccountCreds(id);
-  // 清掉身份监听残留（cookie 监听器挂在已销毁 session 上，timer 不清会空跑）
   watchedSessions.delete(id);
   clearTimeout(identityTimers.get(id));
   identityTimers.delete(id);
   cookiePersistedSessions.delete(id);
 
-  // 先切走并刷新 UI，再清理数据：清理可能耗时，避免界面卡在已删除账号上
-  if (activeId === id) {
-    activeId = null;
-    const vis = visibleAccounts();
-    if (vis.length > 0) {
-      ensureAccountTabs(vis[0]);
-      const tabId = vis[0].activeTabId;
-      if (tabId) switchTab(tabId);
-    } else {
-      win?.webContents.focus();
+  for (const s of aliveShells()) {
+    if (s.activeId !== id) {
+      sendState(s);
+      continue;
     }
+    s.activeId = null;
+    const vis = visibleAccounts(s);
+    if (vis.length > 0) switchAccount(s, vis[0].id);
+    else s.win.webContents.focus();
   }
   scheduleSave();
-  sendState();
 
   try {
     const ses = session.fromPartition(`persist:clouddock-${id}`);
@@ -1476,37 +1633,34 @@ async function removeAccount(id: string): Promise<boolean> {
  */
 let prewarmTimer: NodeJS.Timeout | null = null;
 function prewarmViews(): void {
-  if (!win || win.isDestroyed()) return;
-  // 只预热当前工作区：其余区的会话在磁盘上（persist partition），切区时自然恢复
-  const vis = visibleAccounts();
+  const shell = primaryShell();
+  if (!shell) return;
+  const vis = visibleAccounts(shell);
   let made = 0;
   for (const acc of vis) {
     if (made >= PREWARM_MAX) break;
     if (!acc.home || !isHttpUrl(acc.home)) continue;
     ensureAccountTabs(acc);
     const tab = acc.tabs.find((t) => t.id === acc.activeTabId) ?? acc.tabs[0];
-    if (!tab || views.has(tab.id)) continue;
+    if (!tab || shell.views.has(tab.id)) continue;
     if (!accounts.includes(acc)) continue;
-    createTabView(acc, tab, true);
+    createTabView(shell, acc, tab, true);
     made += 1;
   }
-  // 跨区预热：其他工作区各预热「上次活跃账号」的视图（每区至多 1 个），
-  // 切区命中热视图零冷创建——这是切区卡顿的主因消除点
   let cross = 0;
-  for (const [bid, accId] of Object.entries(berthActive)) {
+  for (const [bid, accId] of Object.entries(shell.berthActive)) {
     if (cross >= PREWARM_BERTHS_MAX) break;
-    if (bid === activeBerthId || !accId) continue;
+    if (bid === shell.activeBerthId || !accId) continue;
     const acc = accounts.find((a) => a.id === accId);
     if (!acc || !acc.home || !isHttpUrl(acc.home)) continue;
-    if (berthOfAccount(acc, berthIds()) !== bid) continue; // 记忆账号已不在此区则跳过
+    if (berthOfAccount(acc, berthIds()) !== bid) continue;
     ensureAccountTabs(acc);
     const tab = acc.tabs.find((t) => t.id === acc.activeTabId) ?? acc.tabs[0];
-    if (!tab || views.has(tab.id)) continue;
-    createTabView(acc, tab, true);
+    if (!tab || shell.views.has(tab.id)) continue;
+    createTabView(shell, acc, tab, true);
     cross += 1;
   }
-  // 活跃账号的 spare：新建标签页（⌘T / 链接新开）零冷启动
-  const active = activeAccount();
+  const active = activeAccount(shell);
   if (active) makeSpareView(active);
   for (const acc of vis) {
     if (!acc.home || !isHttpUrl(acc.home)) continue;
@@ -1539,25 +1693,24 @@ function schedulePrewarm(delayMs: number): void {
  *  - restore=false：每个账号回到干净的起始页（账号本身与登录态保留）
  */
 function resolveCrash(restore: boolean): void {
-  if (!crashRecoveryPending) return;
+  const shell = primaryShell();
+  if (!shell || !crashRecoveryPending) return;
   crashRecoveryPending = false;
   if (!restore) {
     for (const acc of accounts) {
-      // 清掉恢复横幅期间可能已存在的旧视图（横幅期间通常没有，防御性清理）
-      for (const old of acc.tabs) destroyTabView(old.id);
+      for (const old of acc.tabs) destroyTabView(shell, old.id);
       const t = newTabRecord();
       acc.tabs = [t];
       acc.activeTabId = t.id;
     }
     saveAccountsNow();
   }
-  // 无论恢复与否都落到上次账号上：恢复=打开上次的标签页；不恢复=该账号干净的起始页
-  const vis = visibleAccounts();
+  const vis = visibleAccounts(shell);
   if (vis.length > 0) {
     const target = vis.find((a) => a.id === savedActiveId) ?? vis[0];
-    switchAccount(target.id);
+    switchAccount(shell, target.id);
   } else {
-    sendState();
+    sendState(shell);
   }
   schedulePrewarm(15_000);
 }
@@ -1566,84 +1719,85 @@ function resolveCrash(restore: boolean): void {
 
 /** 删除工作区：账号不删（soft-delete 原则），区内账号全部挪回默认区 */
 function removeBerth(bid: string): boolean {
-  if (bid === DEFAULT_BERTH_ID) return false; // 默认区不可删（老账号的归宿）
+  if (bid === DEFAULT_BERTH_ID) return false;
   const b = berths.find((x) => x.id === bid);
   if (!b) return false;
   for (const a of accounts) {
     if (berthOfAccount(a) === bid) a.berthId = DEFAULT_BERTH_ID;
   }
   berths = berths.filter((x) => x.id !== bid);
-  delete berthActive[bid];
+  for (const s of aliveShells()) delete s.berthActive[bid];
   saveBerthsNow();
-  if (activeBerthId === bid) switchBerth(DEFAULT_BERTH_ID);
+  for (const s of aliveShells()) {
+    closeBerthOverlay(s);
+    if (s.activeBerthId === bid) switchBerth(s, DEFAULT_BERTH_ID);
+    else sendState(s);
+  }
   scheduleSave();
-  sendState();
-  closeBerthOverlay();
   return true;
 }
 
 /* ---------- 工作区下拉浮层 ----------
  * 面板必须盖在网页 WebContentsView 之上（DOM 的 z-index 管不了原生视图），
- * 所以做成一个全窗口透明的浮层视图，置于所有子视图最顶；网页区不位移、不缩放。 */
-interface BerthAnchor { x: number; y: number; w: number; h: number }
-let berthOverlay: WebContentsView | null = null;
-let berthOverlayOpen = false;
-let berthOverlayAnchor: BerthAnchor = { x: 0, y: 0, w: 0, h: 0 };
+ * 所以做成一个全窗口透明的浮层视图，置于所有子视图最顶；网页区不位移、不缩放。
+ * 每个窗口自己一份，互不抢。 */
 
-function overlayBounds(): Rectangle {
-  if (!win || win.isDestroyed()) return { x: 0, y: 0, width: 0, height: 0 };
-  const [cw, ch] = win.getContentSize();
+function overlayBounds(shell: Shell): Rectangle {
+  if (shell.win.isDestroyed()) return { x: 0, y: 0, width: 0, height: 0 };
+  const [cw, ch] = shell.win.getContentSize();
   return { x: 0, y: 0, width: cw, height: ch };
 }
 
-function sendBerthOverlayInit(): void {
-  if (!berthOverlay || !berthOverlayOpen) return;
-  berthOverlay.webContents.send('overlay:init', {
+function sendBerthOverlayInit(shell: Shell): void {
+  if (!shell.berthOverlay || !shell.berthOverlayOpen || shell.berthOverlay.webContents.isDestroyed()) return;
+  shell.berthOverlay.webContents.send('overlay:init', {
     berths,
-    activeBerthId,
-    anchor: berthOverlayAnchor,
-    collapsed: sidebarCollapsed,
+    activeBerthId: shell.activeBerthId,
+    anchor: shell.berthOverlayAnchor,
+    collapsed: shell.sidebarCollapsed,
   });
 }
 
-function openBerthOverlay(anchor: BerthAnchor): void {
-  if (!win || win.isDestroyed()) return;
-  if (!berthOverlay) {
-    berthOverlay = new WebContentsView({
+function openBerthOverlay(shell: Shell, anchor: BerthAnchor): void {
+  if (shell.win.isDestroyed()) return;
+  if (!shell.berthOverlay) {
+    shell.berthOverlay = new WebContentsView({
       webPreferences: {
         preload: path.join(__dirname, 'overlayPreload.js'),
         contextIsolation: true,
         nodeIntegration: false,
       },
     });
-    berthOverlay.setBackgroundColor('#00000000');
-    const wc = berthOverlay.webContents;
+    shell.berthOverlay.setBackgroundColor('#00000000');
+    const wc = shell.berthOverlay.webContents;
     wc.on('will-navigate', (e) => e.preventDefault());
     wc.setWindowOpenHandler(() => ({ action: 'deny' }));
     void wc.loadFile(path.join(__dirname, '..', 'overlay.html'));
   }
-  berthOverlayAnchor = anchor;
-  berthOverlayOpen = true;
-  win.contentView.addChildView(berthOverlay); // 已是子视图时会被提到最顶
-  berthOverlay.setBounds(overlayBounds());
-  sendBerthOverlayInit();
-  berthOverlay.webContents.focus();
-  win.webContents.send('berth:panel', true);
+  shell.berthOverlayAnchor = anchor;
+  shell.berthOverlayOpen = true;
+  shell.win.contentView.addChildView(shell.berthOverlay);
+  shell.berthOverlay.setBounds(overlayBounds(shell));
+  sendBerthOverlayInit(shell);
+  shell.berthOverlay.webContents.focus();
+  shell.win.webContents.send('berth:panel', true);
 }
 
-function closeBerthOverlay(): void {
-  if (!berthOverlayOpen) return;
-  berthOverlayOpen = false;
-  if (win && !win.isDestroyed()) {
-    if (berthOverlay) win.contentView.removeChildView(berthOverlay);
-    win.webContents.send('berth:panel', false);
-    win.webContents.focus();
+function closeBerthOverlay(shell: Shell): void {
+  if (!shell.berthOverlayOpen) return;
+  shell.berthOverlayOpen = false;
+  if (!shell.win.isDestroyed()) {
+    if (shell.berthOverlay) shell.win.contentView.removeChildView(shell.berthOverlay);
+    shell.win.webContents.send('berth:panel', false);
+    shell.win.webContents.focus();
   }
 }
 
 /** 菜单「重命名工作区」→ 通知浮层在对应项上内联编辑 */
-function requestBerthRename(id: string): void {
-  if (berthOverlayOpen && berthOverlay) berthOverlay.webContents.send('overlay:rename', id);
+function requestBerthRename(shell: Shell, id: string): void {
+  if (shell.berthOverlayOpen && shell.berthOverlay && !shell.berthOverlay.webContents.isDestroyed()) {
+    shell.berthOverlay.webContents.send('overlay:rename', id);
+  }
 }
 
 /* ---------- 页内查找浮层（⌘F）----------
@@ -1653,101 +1807,105 @@ const FINDBAR_W = 340;
 const FINDBAR_H = 42;
 const FINDBAR_MARGIN = 10;
 
-let findbar: WebContentsView | null = null;
-let findbarOpen = false;
-/** 上次搜索词：跨标签页、跨开关保留（Chrome 查找栏行为） */
-let findText = '';
-
-function sendFindMatches(active: number, total: number): void {
-  if (findbarOpen && findbar && !findbar.webContents.isDestroyed()) {
-    findbar.webContents.send('findbar:matches', { active, total });
+function sendFindMatches(shell: Shell, active: number, total: number): void {
+  if (shell.findbarOpen && shell.findbar && !shell.findbar.webContents.isDestroyed()) {
+    shell.findbar.webContents.send('findbar:matches', { active, total });
   }
 }
 
-function runFind(text: string, forward: boolean, findNext: boolean): void {
-  findText = text;
-  const wc = activeWc();
+function runFind(shell: Shell, text: string, forward: boolean, findNext: boolean): void {
+  shell.findText = text;
+  const wc = activeWc(shell);
   if (!wc || wc.isDestroyed()) return;
   if (!text) {
     wc.stopFindInPage('clearSelection');
-    sendFindMatches(0, 0);
+    sendFindMatches(shell, 0, 0);
     return;
   }
   wc.findInPage(text, { forward, findNext, matchCase: false });
 }
 
-function openFindbar(): void {
-  if (!win || win.isDestroyed() || !activeWc()) return; // 没有网页可搜
-  if (!findbar) {
-    findbar = new WebContentsView({
+function openFindbar(shell: Shell): void {
+  if (shell.win.isDestroyed() || !activeWc(shell)) return;
+  if (!shell.findbar) {
+    shell.findbar = new WebContentsView({
       webPreferences: {
         preload: path.join(__dirname, 'findbarPreload.js'),
         contextIsolation: true,
         nodeIntegration: false,
       },
     });
-    findbar.setBackgroundColor('#00000000');
-    const wc = findbar.webContents;
+    shell.findbar.setBackgroundColor('#00000000');
+    const wc = shell.findbar.webContents;
     wc.on('will-navigate', (e) => e.preventDefault());
     wc.setWindowOpenHandler(() => ({ action: 'deny' }));
     void wc.loadFile(path.join(__dirname, '..', 'findbar.html'));
   }
-  findbarOpen = true;
-  win.contentView.addChildView(findbar); // 已是子视图时会被提到最顶
-  findbar.setBounds(findbarAnchor(viewBounds(), FINDBAR_W, FINDBAR_H, FINDBAR_MARGIN));
-  findbar.webContents.send('findbar:init', { text: findText });
-  findbar.webContents.focus();
+  shell.findbarOpen = true;
+  shell.win.contentView.addChildView(shell.findbar);
+  shell.findbar.setBounds(findbarAnchor(viewBounds(shell), FINDBAR_W, FINDBAR_H, FINDBAR_MARGIN));
+  shell.findbar.webContents.send('findbar:init', { text: shell.findText });
+  shell.findbar.webContents.focus();
 }
 
-function closeFindbar(): void {
-  if (!findbarOpen) return;
-  findbarOpen = false;
-  const wc = activeWc();
+function closeFindbar(shell: Shell): void {
+  if (!shell.findbarOpen) return;
+  shell.findbarOpen = false;
+  const wc = activeWc(shell);
   if (wc && !wc.isDestroyed()) wc.stopFindInPage('clearSelection');
-  if (win && !win.isDestroyed()) {
-    if (findbar) win.contentView.removeChildView(findbar);
+  if (!shell.win.isDestroyed()) {
+    if (shell.findbar) shell.win.contentView.removeChildView(shell.findbar);
     if (wc && !wc.isDestroyed()) wc.focus();
-    else win.webContents.focus();
+    else shell.win.webContents.focus();
   }
 }
 
 /** ⌘G / ⇧⌘G：栏已开 = 跳下一个/上一个；栏未开 = 用上次搜索词直接开查 */
-function findStep(forward: boolean): void {
-  if (!findText) {
-    openFindbar();
+function findStep(shell: Shell, forward: boolean): void {
+  if (!shell.findText) {
+    openFindbar(shell);
     return;
   }
-  const wasOpen = findbarOpen;
-  if (!wasOpen) openFindbar();
-  if (findbarOpen) runFind(findText, forward, wasOpen);
+  const wasOpen = shell.findbarOpen;
+  if (!wasOpen) openFindbar(shell);
+  if (shell.findbarOpen) runFind(shell, shell.findText, forward, wasOpen);
 }
 
-/** 切换标签页/账号后：清掉所有旧页高亮，同一搜索词在新活跃页重查 */
-function retargetFindbar(): void {
-  if (!findbarOpen) return;
-  for (const v of views.values()) {
+/** 切换标签页/账号后：清掉本窗口旧页高亮，同一搜索词在新活跃页重查 */
+function retargetFindbar(shell: Shell): void {
+  if (!shell.findbarOpen) return;
+  for (const v of shell.views.values()) {
     if (!v.webContents.isDestroyed()) v.webContents.stopFindInPage('clearSelection');
   }
-  runFind(findText, true, false);
+  runFind(shell, shell.findText, true, false);
 }
 
 function registerIpc(): void {
-  // 当前工作区的账号（工作区过滤后的视图；主进程是唯一过滤口径）
-  ipcMain.handle('accounts:list', () => visibleAccounts());
+  const uiOf = (sender: WebContents): Shell | null => {
+    const s = shellByWebContents(sender);
+    if (!s || s.win.isDestroyed() || s.win.webContents !== sender) return null;
+    return s;
+  };
 
-  // Windows 自绘标题栏的窗口控制（macOS 红绿灯走系统，不经此通道）
-  ipcMain.on('win:control', (_e, action: unknown) => {
-    if (!win) return;
-    const act = String(action);
-    if (act === 'minimize') win.minimize();
-    else if (act === 'maximize') {
-      if (win.isMaximized()) win.unmaximize();
-      else win.maximize();
-    } else if (act === 'close') win.close();
+  ipcMain.handle('accounts:list', (e) => {
+    const shell = uiOf(e.sender);
+    return shell ? projectAccounts(shell) : [];
   });
 
-  ipcMain.handle('accounts:add', (_e, name: unknown, note: unknown): Account => {
-    // 无需手动输入：新建独立会话并打开起始页，选站点登录后自动命名
+  ipcMain.on('win:control', (e, action: unknown) => {
+    const shell = uiOf(e.sender);
+    if (!shell) return;
+    const act = String(action);
+    if (act === 'minimize') shell.win.minimize();
+    else if (act === 'maximize') {
+      if (shell.win.isMaximized()) shell.win.unmaximize();
+      else shell.win.maximize();
+    } else if (act === 'close') shell.win.close();
+  });
+
+  ipcMain.handle('accounts:add', (e, name: unknown, note: unknown): Account | null => {
+    const shell = uiOf(e.sender);
+    if (!shell) return null;
     const manualName = String(name ?? '').trim().slice(0, 30);
     const loginTab = newTabRecord('');
     let seq = 1;
@@ -1759,26 +1917,31 @@ function registerIpc(): void {
       color: pickColor(),
       createdAt: Date.now(),
       autoName: !manualName,
-      berthId: activeBerthId, // 新账号归当前工作区
+      berthId: shell.activeBerthId,
       tabs: [loginTab],
       activeTabId: loginTab.id,
     };
     accounts.push(acc);
     scheduleSave();
-    switchAccount(acc.id);
+    switchAccount(shell, acc.id);
+    sendStateAll();
     return acc;
   });
 
-  ipcMain.handle('accounts:remove', (_e, id: unknown) => removeAccount(String(id)));
+  ipcMain.handle('accounts:remove', (e, id: unknown) => {
+    const shell = uiOf(e.sender) ?? shellByWebContents(e.sender);
+    if (!shell) return false;
+    return removeAccount(shell, String(id));
+  });
 
-  /** 拖拽排序：orderedIds = 当前工作区可见账号的完整新顺序（槽位内换序，其他区不受影响） */
-  ipcMain.handle('accounts:reorder', (_e, orderedIds: unknown): boolean => {
-    if (!Array.isArray(orderedIds)) return false;
-    const next = reorderAccountsInBerth(accounts, activeBerthId, orderedIds.map(String));
-    if (next === accounts) return false; // 无变化/入参不合法
+  ipcMain.handle('accounts:reorder', (e, orderedIds: unknown): boolean => {
+    const shell = uiOf(e.sender);
+    if (!shell || !Array.isArray(orderedIds)) return false;
+    const next = reorderAccountsInBerth(accounts, shell.activeBerthId, orderedIds.map(String));
+    if (next === accounts) return false;
     accounts = next;
     scheduleSave();
-    sendState();
+    sendStateAll();
     return true;
   });
 
@@ -1788,20 +1951,24 @@ function registerIpc(): void {
     const n = String(name ?? '').trim().slice(0, 30);
     if (!n) return false;
     acc.name = n;
-    acc.autoName = false; // 手动命名后不再被自动识别覆盖
+    acc.autoName = false;
     if (acc.note === PENDING_NOTE) acc.note = '';
     scheduleSave();
-    sendState();
+    sendStateAll();
     return true;
   });
 
-  ipcMain.handle('accounts:switch', (_e, id: unknown): boolean => switchAccount(String(id)));
-
-  /* ---------- 工作区（Berth）IPC ---------- */
+  ipcMain.handle('accounts:switch', (e, id: unknown): boolean => {
+    const shell = uiOf(e.sender);
+    if (!shell) return false;
+    return switchAccount(shell, String(id));
+  });
 
   ipcMain.handle('berths:list', (): Berth[] => berths);
 
-  ipcMain.handle('berths:add', (_e, name: unknown, icon: unknown): Berth | null => {
+  ipcMain.handle('berths:add', (e, name: unknown, icon: unknown): Berth | null => {
+    const shell = uiOf(e.sender) ?? shellByWebContents(e.sender);
+    if (!shell) return null;
     const n = String(name ?? '').trim().slice(0, 12);
     if (!n) return null;
     const b: Berth = {
@@ -1812,78 +1979,86 @@ function registerIpc(): void {
     };
     berths.push(b);
     saveBerthsNow();
-    switchBerth(b.id); // 新建即切入，符合「为这件事开一个区」的心智
-    closeBerthOverlay();
+    switchBerth(shell, b.id);
+    closeBerthOverlay(shell);
+    sendStateAll();
     return b;
   });
 
-  ipcMain.handle('berths:rename', (_e, id: unknown, name: unknown): boolean => {
+  ipcMain.handle('berths:rename', (e, id: unknown, name: unknown): boolean => {
+    const shell = shellByWebContents(e.sender);
     const b = berths.find((x) => x.id === String(id));
     if (!b) return false;
     const n = String(name ?? '').trim().slice(0, 12);
     if (!n) return false;
     b.name = n;
     saveBerthsNow();
-    sendState();
-    closeBerthOverlay();
+    if (shell) closeBerthOverlay(shell);
+    sendStateAll();
     return true;
   });
 
   ipcMain.handle('berths:remove', (_e, id: unknown): boolean => removeBerth(String(id)));
 
-  ipcMain.handle('berths:switch', (_e, id: unknown): boolean => {
-    const ok = switchBerth(String(id));
-    closeBerthOverlay();
+  ipcMain.handle('berths:switch', (e, id: unknown): boolean => {
+    const shell = shellByWebContents(e.sender);
+    if (!shell) return false;
+    const ok = switchBerth(shell, String(id));
+    closeBerthOverlay(shell);
     return ok;
   });
 
-  // 工作区下拉浮层：主窗口点击触发器 → 开/关；浮层页自身负责就绪/关闭回调
   ipcMain.handle('berths:panel-toggle', (e, anchor: unknown): boolean => {
-    if (!win || e.sender !== win.webContents) return false;
-    if (berthOverlayOpen) {
-      closeBerthOverlay();
+    const shell = uiOf(e.sender);
+    if (!shell) return false;
+    if (shell.berthOverlayOpen) {
+      closeBerthOverlay(shell);
       return false;
     }
     const a = (anchor ?? {}) as Record<string, unknown>;
     const n = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
-    openBerthOverlay({ x: n(a.x), y: n(a.y), w: n(a.w), h: n(a.h) });
+    openBerthOverlay(shell, { x: n(a.x), y: n(a.y), w: n(a.w), h: n(a.h) });
     return true;
   });
   ipcMain.handle('overlay:ready', (e): void => {
-    if (berthOverlay && e.sender === berthOverlay.webContents) sendBerthOverlayInit();
+    const shell = shellByWebContents(e.sender);
+    if (shell?.berthOverlay && e.sender === shell.berthOverlay.webContents) sendBerthOverlayInit(shell);
   });
   ipcMain.handle('overlay:close', (e): void => {
-    if (berthOverlay && e.sender === berthOverlay.webContents) closeBerthOverlay();
+    const shell = shellByWebContents(e.sender);
+    if (shell?.berthOverlay && e.sender === shell.berthOverlay.webContents) closeBerthOverlay(shell);
   });
 
-  // 页内查找浮层：仅接受来自搜索栏自身的调用；查询词限长防滥用
   ipcMain.handle('findbar:ready', (e): void => {
-    if (findbar && e.sender === findbar.webContents && findbarOpen) {
-      findbar.webContents.send('findbar:init', { text: findText });
+    const shell = shellByWebContents(e.sender);
+    if (shell?.findbar && e.sender === shell.findbar.webContents && shell.findbarOpen) {
+      shell.findbar.webContents.send('findbar:init', { text: shell.findText });
     }
   });
   ipcMain.handle('find:query', (e, text: unknown, forward: unknown, findNext: unknown): void => {
-    if (!findbar || e.sender !== findbar.webContents) return;
-    runFind(String(text ?? '').slice(0, 200), forward !== false, Boolean(findNext));
+    const shell = shellByWebContents(e.sender);
+    if (!shell?.findbar || e.sender !== shell.findbar.webContents) return;
+    runFind(shell, String(text ?? '').slice(0, 200), forward !== false, Boolean(findNext));
   });
   ipcMain.handle('find:close', (e): void => {
-    if (findbar && e.sender === findbar.webContents) closeFindbar();
+    const shell = shellByWebContents(e.sender);
+    if (shell?.findbar && e.sender === shell.findbar.webContents) closeFindbar(shell);
   });
 
-  // 工作区右键菜单：重命名 / 删除
-  ipcMain.handle('berths:menu', (_e, id: unknown): void => {
+  ipcMain.handle('berths:menu', (e, id: unknown): void => {
+    const shell = shellByWebContents(e.sender);
     const b = berths.find((x) => x.id === String(id));
-    if (!b || !win) return;
+    if (!b || !shell) return;
     const isDefault = b.id === DEFAULT_BERTH_ID;
     Menu.buildFromTemplate([
-      { label: `重命名「${b.name}」`, enabled: !isDefault, click: () => requestBerthRename(b.id) },
+      { label: `重命名「${b.name}」`, enabled: !isDefault, click: () => requestBerthRename(shell, b.id) },
       { type: 'separator' },
       {
         label: `删除工作区「${b.name}」…`,
         enabled: !isDefault,
         click: () => {
           void dialog
-            .showMessageBox(win!, {
+            .showMessageBox(shell.win, {
               type: 'warning',
               buttons: ['删除', '取消'],
               defaultId: 1,
@@ -1896,43 +2071,40 @@ function registerIpc(): void {
             });
         },
       },
-    ]).popup({ window: win });
+    ]).popup({ window: shell.win });
   });
 
-  // 侧边栏：收起 / 展开（不传参数 = 切换）
-  ipcMain.handle('ui:sidebar', (_e, collapsed: unknown): boolean => {
-    setSidebarCollapsed(typeof collapsed === 'boolean' ? collapsed : !sidebarCollapsed);
-    return sidebarCollapsed;
+  ipcMain.handle('ui:sidebar', (e, collapsed: unknown): boolean => {
+    const shell = uiOf(e.sender);
+    if (!shell) return false;
+    setSidebarCollapsed(shell, typeof collapsed === 'boolean' ? collapsed : !shell.sidebarCollapsed);
+    return shell.sidebarCollapsed;
   });
 
-  // 侧边栏行内编辑前把键盘焦点拿回 UI 页面（否则按键/输入法会落到网页视图里）
-  ipcMain.handle('ui:focus', (): void => {
-    win?.webContents.focus();
+  ipcMain.handle('ui:focus', (e): void => {
+    uiOf(e.sender)?.win.webContents.focus();
   });
 
-  // 账号右键菜单 / 「⋯」按钮
-  ipcMain.handle('accounts:menu', (_e, id: unknown): void => {
+  ipcMain.handle('accounts:menu', (e, id: unknown): void => {
+    const shell = uiOf(e.sender);
     const acc = accounts.find((a) => a.id === String(id));
-    if (!acc || !win) return;
+    if (!acc || !shell) return;
     Menu.buildFromTemplate([
-      { label: '重命名', click: () => requestRename(acc.id) },
+      { label: '在新窗口打开', click: () => openNewWindow(acc.id) },
       { type: 'separator' },
-      ...cookieMenuItems(acc),
+      { label: '重命名', click: () => requestRename(shell, acc.id) },
       { type: 'separator' },
-      { label: '删除账号…', click: () => void removeAccount(acc.id) },
-    ]).popup({ window: win });
+      ...cookieMenuItems(shell, acc),
+      { type: 'separator' },
+      { label: '删除账号…', click: () => void removeAccount(shell, acc.id) },
+    ]).popup({ window: shell.win });
   });
 
-  /* ----- 密码管理 ----- */
-  // 页面注入脚本 -> 主进程：发送方必须是账号标签页里的 http(s) 页面
   ipcMain.on('cred:captured', (e, raw: unknown) => {
     if (!credOrigin(e.sender.getURL())) return;
     void onCaptured(e.sender.id, e.senderFrame?.url, raw);
   });
 
-  // 登录过程中的心跳（页面仍在输入）与「表单已消失」。
-  // 注意：e.sender.id 是 webContents id，pending 记的是 tab 记录 id，必须经 wcMap 换算，
-  // 直接拿数字 id 去比对 hex tab id 永远不匹配（曾导致心跳/放弃检测空转，慢登录超时丢提示）。
   ipcMain.on('cred:active', (e) => {
     if (!credOrigin(e.sender.getURL())) return;
     const ctx = wcMap.get(e.sender.id);
@@ -1945,8 +2117,6 @@ function registerIpc(): void {
     if (ctx) abandonPending(ctx.tab.id);
   });
 
-  // 起始页的地址输入：由主进程统一解析（与地址栏 nav:url 同一套 resolveInput），start.html 不再留一份拷贝。
-  // 只对已登记的 tab 视图、且当前确实停在起始页时生效，普通网站调用一律拒绝。
   ipcMain.handle('nav:start-input', (e, raw: unknown): boolean => {
     const ctx = wcMap.get(e.sender.id);
     if (!ctx || !accounts.includes(ctx.acc)) return false;
@@ -1963,8 +2133,6 @@ function registerIpc(): void {
     }
   });
 
-  // 只回给【origin 与保存时完全一致】的页面/iframe；顶层页面也必须是 http(s)
-  // 解密在 vault 子进程完成，明文只发往发起请求的页面，不落盘、不进 UI 进程
   ipcMain.handle('cred:get', async (e): Promise<FillPayload | null> => {
     const ctx = wcMap.get(e.sender.id);
     if (!ctx || !accounts.includes(ctx.acc)) return null;
@@ -1974,58 +2142,67 @@ function registerIpc(): void {
     return vault.decrypt(ctx.acc.id, origin);
   });
 
-  // 以下来自界面进程（preload 暴露的 api），只接受主窗口
-  const fromUi = (e: Electron.IpcMainInvokeEvent): boolean => !!win && e.sender === win.webContents;
-
   ipcMain.handle('cred:save', async (e): Promise<boolean> => {
-    // banner 只显示当前账号的提示，保存也只作用于该账号名下的捕获
-    const p = activeId ? pendings.get(activeId) : undefined;
-    if (!fromUi(e) || !p?.armed || !vault.available) return false;
+    const shell = uiOf(e.sender);
+    const p = shell?.activeId ? pendings.get(shell.activeId) : undefined;
+    if (!shell || !p?.armed || !vault.available) return false;
     const acc = accounts.find((a) => a.id === p.accountId);
     if (!acc) {
       clearPending(p.accountId);
-      sendState();
+      sendStateAll();
       return false;
     }
     const ok = await vault.save(p.accountId, p.origin, credLabel(p.login.fields), p.login, p.existingId);
     if (!ok) return false;
     clearPending(p.accountId);
-    sendState();
+    sendStateAll();
     return true;
   });
 
-  // never=true：从不保存此网站（对应账号 + origin）
   ipcMain.handle('cred:dismiss', (e, never: unknown): boolean => {
-    const p = activeId ? pendings.get(activeId) : undefined;
-    if (!fromUi(e) || !p) return false;
+    const shell = uiOf(e.sender);
+    const p = shell?.activeId ? pendings.get(shell.activeId) : undefined;
+    if (!shell || !p) return false;
     if (never === true && !isNever(p.accountId, p.origin)) {
       void vault.addNever(p.accountId, p.origin);
     }
     clearPending(p.accountId);
-    sendState();
+    sendStateAll();
     return true;
   });
 
-  /* ----- 崩溃恢复横幅 ----- */
   ipcMain.handle('crash:resolve', (e, restore: unknown): boolean => {
-    if (!fromUi(e)) return false;
+    const shell = uiOf(e.sender);
+    if (!shell?.primary) return false;
     resolveCrash(restore === true);
     return true;
   });
 
-  ipcMain.handle('tabs:new', (_e, url: unknown): boolean => {
-    const acc = activeAccount() ?? accounts[0];
+  ipcMain.handle('tabs:new', (e, url: unknown): boolean => {
+    const shell = uiOf(e.sender);
+    if (!shell) return false;
+    const acc = activeAccount(shell) ?? visibleAccounts(shell)[0];
     if (!acc) return false;
-    newTabForAccount(acc, typeof url === 'string' ? url : undefined);
+    newTabForAccount(shell, acc, typeof url === 'string' ? url : undefined);
     return true;
   });
 
-  ipcMain.handle('tabs:close', (_e, tabId: unknown): boolean => closeTab(String(tabId)));
+  ipcMain.handle('tabs:close', (e, tabId: unknown): boolean => {
+    const shell = uiOf(e.sender);
+    if (!shell) return false;
+    return closeTab(shell, String(tabId));
+  });
 
-  ipcMain.handle('tabs:switch', (_e, tabId: unknown): boolean => switchTab(String(tabId)));
+  ipcMain.handle('tabs:switch', (e, tabId: unknown): boolean => {
+    const shell = uiOf(e.sender);
+    if (!shell) return false;
+    return switchTab(shell, String(tabId));
+  });
 
-  ipcMain.handle('nav:action', (_e, action: unknown): void => {
-    const wc = activeWc();
+  ipcMain.handle('nav:action', (e, action: unknown): void => {
+    const shell = uiOf(e.sender);
+    if (!shell) return;
+    const wc = activeWc(shell);
     if (!wc) return;
     dropUnarmedPending();
     switch (String(action)) {
@@ -2042,15 +2219,17 @@ function registerIpc(): void {
         wc.stop();
         break;
       case 'home':
-        safeLoad(wc, activeAccount()?.home ?? startUrl());
+        safeLoad(wc, activeAccount(shell)?.home ?? startUrl());
         break;
       default:
         break;
     }
   });
 
-  ipcMain.handle('nav:url', (_e, raw: unknown): boolean => {
-    const wc = activeWc();
+  ipcMain.handle('nav:url', (e, raw: unknown): boolean => {
+    const shell = uiOf(e.sender);
+    if (!shell) return false;
+    const wc = activeWc(shell);
     if (!wc) return false;
     dropUnarmedPending();
     const url = resolveInput(String(raw ?? ''));
@@ -2070,7 +2249,8 @@ function registerIpc(): void {
 
 /** 「密码」菜单：列出当前账号已保存的密码（点击删除），恢复「从不保存」，全部清除 */
 function passwordMenu(): MenuItemConstructorOptions {
-  const acc = activeAccount();
+  const shell = focusedShell();
+  const acc = shell ? activeAccount(shell) : null;
   const mine = vault.entries
     .filter((e) => e.accountId === acc?.id)
     .sort((a, b) => b.updatedAt - a.updatedAt);
@@ -2102,7 +2282,7 @@ function passwordMenu(): MenuItemConstructorOptions {
       enabled: neverCount > 0,
       click: () => {
         if (!acc) return;
-        void vault.restoreNever(acc.id).then(() => sendState());
+        void vault.restoreNever(acc.id).then(() => sendStateAll());
       },
     },
     {
@@ -2121,38 +2301,47 @@ function retryVault(): void {
   void vault.retry().then(() => {
     console.log(`[workpier] vault retry: available=${vault.available} failed=${vault.initFailed} entries=${vault.entries.length}`);
     buildMenu();
-    sendState();
+    sendStateAll();
   });
 }
 
 /** 「账号」菜单：重命名、清除 Cookie（作用于当前账号） */
 function accountMenu(): MenuItemConstructorOptions {
-  const acc = activeAccount();
-  const items: MenuItemConstructorOptions[] = acc
+  const shell = focusedShell();
+  const acc = shell ? activeAccount(shell) : null;
+  const items: MenuItemConstructorOptions[] = acc && shell
     ? [
         { label: `当前账号：${acc.name}`, enabled: false },
-        { label: '重命名', click: () => requestRename(acc.id) },
+        { label: '在新窗口打开', click: () => openNewWindow(acc.id) },
+        { label: '重命名', click: () => requestRename(shell, acc.id) },
         { type: 'separator' },
-        ...cookieMenuItems(acc),
+        ...cookieMenuItems(shell, acc),
       ]
     : [{ label: '请先选择账号', enabled: false }];
-  items.push({ type: 'separator' }, { label: '清除所有账号的 Cookie…', enabled: accounts.length > 0, click: () => void clearAllAccountsCookies() });
+  items.push(
+    { type: 'separator' },
+    { label: '清除所有账号的 Cookie…', enabled: accounts.length > 0, click: () => void clearAllAccountsCookies() },
+  );
   return { label: '账号', submenu: items };
 }
 
 let menuSig = '';
 /** 当前账号 / 已存密码 / vault 可用性变化时才重建菜单（sendState 很频繁） */
 function menuSignature(): string {
+  const shell = focusedShell();
+  const id = shell?.activeId ?? null;
   return JSON.stringify([
-    activeId,
-    activeAccount()?.name,
+    shell?.win.id ?? 0,
+    id,
+    shell ? activeAccount(shell)?.name : null,
     accounts.length,
-    activeBerthId,
-    visibleAccounts().length,
+    shell?.activeBerthId,
+    shell ? visibleAccounts(shell).length : 0,
+    aliveShells().map((s) => [s.win.id, s.win.getTitle()]),
     vault.available,
     vault.initFailed,
-    vault.entries.filter((e) => e.accountId === activeId).map((e) => [e.id, e.origin, e.label]),
-    vault.never.filter((n) => n.accountId === activeId).length,
+    vault.entries.filter((e) => e.accountId === id).map((e) => [e.id, e.origin, e.label]),
+    vault.never.filter((n) => n.accountId === id).length,
   ]);
 }
 function refreshMenuIfNeeded(): void {
@@ -2163,8 +2352,10 @@ function refreshMenuIfNeeded(): void {
 
 function buildMenu(): void {
   menuSig = menuSignature();
+  const front = (): Shell | null => focusedShell();
   const zoom = (delta: number): void => {
-    const wc = activeWc();
+    const shell = front();
+    const wc = shell ? activeWc(shell) : null;
     if (!wc) return;
     const next = delta === 0 ? 1 : Math.min(3, Math.max(0.5, wc.getZoomFactor() + delta));
     wc.setZoomFactor(next);
@@ -2175,24 +2366,31 @@ function buildMenu(): void {
     {
       label: '视图',
       submenu: [
-        { label: '收起 / 展开侧边栏', accelerator: 'CmdOrCtrl+B', click: () => setSidebarCollapsed(!sidebarCollapsed) },
+        {
+          label: '收起 / 展开侧边栏',
+          accelerator: 'CmdOrCtrl+B',
+          click: () => {
+            const shell = front();
+            if (shell) setSidebarCollapsed(shell, !shell.sidebarCollapsed);
+          },
+        },
         { type: 'separator' },
-        { label: '刷新当前标签页', accelerator: 'CmdOrCtrl+R', click: () => activeWc()?.reload() },
-        { label: '后退', accelerator: 'CmdOrCtrl+[', click: () => activeWc()?.goBack() },
-        { label: '前进', accelerator: 'CmdOrCtrl+]', click: () => activeWc()?.goForward() },
+        { label: '刷新当前标签页', accelerator: 'CmdOrCtrl+R', click: () => { const s = front(); if (s) activeWc(s)?.reload(); } },
+        { label: '后退', accelerator: 'CmdOrCtrl+[', click: () => { const s = front(); if (s) activeWc(s)?.goBack(); } },
+        { label: '前进', accelerator: 'CmdOrCtrl+]', click: () => { const s = front(); if (s) activeWc(s)?.goForward(); } },
         { type: 'separator' },
         { label: '放大', accelerator: 'CmdOrCtrl+=', click: () => zoom(0.1) },
         { label: '缩小', accelerator: 'CmdOrCtrl+-', click: () => zoom(-0.1) },
         { label: '重置缩放', accelerator: 'CmdOrCtrl+0', click: () => zoom(0) },
         { type: 'separator' },
-        { label: '在页面中查找…', accelerator: 'CmdOrCtrl+F', click: () => openFindbar() },
-        { label: '查找下一个', accelerator: 'CmdOrCtrl+G', click: () => findStep(true) },
-        { label: '查找上一个', accelerator: 'CmdOrCtrl+Shift+G', click: () => findStep(false) },
+        { label: '在页面中查找…', accelerator: 'CmdOrCtrl+F', click: () => { const s = front(); if (s) openFindbar(s); } },
+        { label: '查找下一个', accelerator: 'CmdOrCtrl+G', click: () => { const s = front(); if (s) findStep(s, true); } },
+        { label: '查找上一个', accelerator: 'CmdOrCtrl+Shift+G', click: () => { const s = front(); if (s) findStep(s, false); } },
         { type: 'separator' },
         {
           label: '开发者工具（当前标签页）',
           accelerator: 'CmdOrCtrl+Alt+I',
-          click: () => activeWc()?.openDevTools({ mode: 'bottom' }),
+          click: () => { const s = front(); if (s) activeWc(s)?.openDevTools({ mode: 'bottom' }); },
         },
         { role: 'togglefullscreen' },
       ],
@@ -2204,21 +2402,24 @@ function buildMenu(): void {
           label: '新建标签页',
           accelerator: 'CmdOrCtrl+T',
           click: () => {
-            const acc = activeAccount() ?? visibleAccounts()[0];
-            if (acc) newTabForAccount(acc);
+            const shell = front();
+            if (!shell) return;
+            const acc = activeAccount(shell) ?? visibleAccounts(shell)[0];
+            if (acc) newTabForAccount(shell, acc);
           },
         },
         {
           label: '关闭标签页',
           accelerator: 'CmdOrCtrl+W',
           click: () => {
-            const tab = activeTab();
-            if (tab) closeTab(tab.id);
+            const shell = front();
+            const tab = shell ? activeTab(shell) : null;
+            if (shell && tab) closeTab(shell, tab.id);
           },
         },
         { type: 'separator' },
-        { label: '上一个标签页', accelerator: 'CmdOrCtrl+Shift+[', click: () => cycleTab(-1) },
-        { label: '下一个标签页', accelerator: 'CmdOrCtrl+Shift+]', click: () => cycleTab(1) },
+        { label: '上一个标签页', accelerator: 'CmdOrCtrl+Shift+[', click: () => { const s = front(); if (s) cycleTab(s, -1); } },
+        { label: '下一个标签页', accelerator: 'CmdOrCtrl+Shift+]', click: () => { const s = front(); if (s) cycleTab(s, 1); } },
       ],
     },
     accountMenu(),
@@ -2237,7 +2438,28 @@ function buildMenu(): void {
     // 不用 role:'windowMenu'：它自带「关闭窗口 ⌘W」，会与「关闭标签页 ⌘W」抢快捷键
     {
       label: '窗口',
-      submenu: [{ role: 'minimize' }, { role: 'zoom' }, { type: 'separator' }, { role: 'front' }],
+      submenu: [
+        { id: 'new-window', label: '新建窗口', accelerator: 'CmdOrCtrl+N', click: () => openNewWindow() },
+        { type: 'separator' },
+        { role: 'minimize' },
+        { role: 'zoom' },
+        { type: 'separator' },
+        ...aliveShells().map(
+          (s): MenuItemConstructorOptions => ({
+            label: s.win.getTitle() || 'WorkPier',
+            type: 'checkbox',
+            checked: s.win.isFocused(),
+            click: () => {
+              if (s.win.isDestroyed()) return;
+              if (s.win.isMinimized()) s.win.restore();
+              s.win.show();
+              s.win.focus();
+            },
+          }),
+        ),
+        { type: 'separator' },
+        { role: 'front' },
+      ],
     },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
@@ -2256,12 +2478,68 @@ function preUpdateExit(): void {
   }
 }
 
-function createWindow(): void {
-  win = new BrowserWindow({
+/** 这个窗口当前页的网址。新窗口用来接着看同一页，登录态仍是这个账号的。 */
+function pageUrlOf(shell: Shell): string {
+  const tab = activeTab(shell);
+  if (!tab) return '';
+  const live = shell.views.get(tab.id)?.webContents.getURL();
+  if (live && isHttpUrl(live)) return live;
+  return isHttpUrl(tab.url) ? tab.url : '';
+}
+
+/**
+ * 再开一个软件窗口。
+ * accountId 指定时打开那个账号；不指定时打开当前窗口正在看的账号和页面。
+ */
+function openNewWindow(accountId?: string): void {
+  const src = focusedShell();
+  const acc = accountId
+    ? accounts.find((a) => a.id === accountId) ?? null
+    : src
+      ? activeAccount(src)
+      : null;
+  const berthId = acc ? berthOfAccount(acc, berthIds()) : (src?.activeBerthId ?? bootBerthId);
+  let bootUrl = '';
+  if (acc) {
+    if (src && src.activeId === acc.id) bootUrl = pageUrlOf(src);
+    if (!bootUrl && acc.home && isHttpUrl(acc.home)) bootUrl = acc.home;
+  }
+  createShell({
+    primary: false,
+    activeBerthId: berthId,
+    sidebarCollapsed: src?.sidebarCollapsed ?? bootSidebarCollapsed,
+    berthActive: { ...(src?.berthActive ?? bootBerthActive) },
+    bootAccountId: acc?.id ?? null,
+    bootUrl,
+  });
+}
+
+function installDockMenu(): void {
+  if (process.platform !== 'darwin' || !app.dock) return;
+  app.dock.setMenu(
+    Menu.buildFromTemplate([{ label: '新建窗口', click: () => openNewWindow() }]),
+  );
+}
+
+interface CreateShellOpts {
+  primary: boolean;
+  activeBerthId?: string;
+  sidebarCollapsed?: boolean;
+  berthActive?: Record<string, string>;
+  bootAccountId?: string | null;
+  bootUrl?: string;
+  /** 只有启动时的主窗口处理更新握手 */
+  startup?: boolean;
+}
+
+function createShell(opts: CreateShellOpts): Shell {
+  const anchor = !opts.primary ? focusedShell()?.win.getBounds() : undefined;
+  const win = new BrowserWindow({
     width: 1440,
     height: 900,
     minWidth: 1024,
     minHeight: 640,
+    ...(anchor ? { x: anchor.x + 28, y: anchor.y + 28 } : {}),
     // macOS：hiddenInset + 系统红绿灯；Windows：hidden 全自绘（renderer 补窗口控制按钮）
     ...(IS_WIN
       ? { titleBarStyle: 'hidden' as const }
@@ -2274,62 +2552,121 @@ function createWindow(): void {
       nodeIntegration: false,
     },
   });
+  const shell: Shell = {
+    win,
+    primary: opts.primary,
+    activeId: null,
+    activeBerthId: opts.primary ? bootBerthId : (opts.activeBerthId ?? bootBerthId),
+    berthActive: opts.primary ? { ...bootBerthActive } : { ...(opts.berthActive ?? {}) },
+    sidebarCollapsed: opts.primary ? bootSidebarCollapsed : (opts.sidebarCollapsed ?? bootSidebarCollapsed),
+    localTabs: new Map(),
+    views: new Map(),
+    berthOverlay: null,
+    berthOverlayOpen: false,
+    berthOverlayAnchor: { x: 0, y: 0, w: 0, h: 0 },
+    findbar: null,
+    findbarOpen: false,
+    findText: '',
+    bootAccountId: opts.bootAccountId ?? null,
+    bootUrl: opts.bootUrl ?? '',
+  };
+  shells.push(shell);
   if (IS_WIN) {
-    // Windows 菜单栏不常驻（Alt 呼出，Chrome 同款）；快捷键仍然全局生效
     win.setAutoHideMenuBar(true);
     win.setMenuBarVisibility(false);
   }
   win.loadFile(path.join(__dirname, '..', 'index.html'));
   win.once('ready-to-show', () => {
-    win?.show();
-    if (updateToken) {
-      // 更新启动：新版本 UI 已就绪，写握手信号让老实例退出，再补拿单实例锁
-      try {
-        fs.writeFileSync(updateToken, 'ok', { encoding: 'utf-8' });
-      } catch {
-        /* 写失败由老实例 30s 超时回滚兜底 */
-      }
-      // Windows 更新流程没有「老实例收尾删除」：10s 后自行清理握手 token 文件
-      // （macOS 双删无害；10s 足够老实例的 500ms 轮询命中）
-      setTimeout(() => {
-        try {
-          fs.rmSync(updateToken, { force: true });
-        } catch {
-          /* ignore */
-        }
-      }, 10_000).unref?.();
-      retrySingleInstanceLock();
+    if (win.isDestroyed()) return;
+    win.show();
+    if (!(opts.primary && opts.startup && updateToken)) return;
+    try {
+      fs.writeFileSync(updateToken, 'ok', { encoding: 'utf-8' });
+    } catch {
+      /* 写失败由老实例 30s 超时回滚兜底 */
     }
+    setTimeout(() => {
+      try {
+        fs.rmSync(updateToken, { force: true });
+      } catch {
+        /* ignore */
+      }
+    }, 10_000).unref?.();
+    retrySingleInstanceLock();
   });
 
-  const relayout = (): void => layoutViews();
+  const relayout = (): void => layoutViews(shell);
   win.on('resize', relayout);
   win.on('enter-full-screen', relayout);
   win.on('leave-full-screen', relayout);
+  win.on('focus', () => refreshMenuIfNeeded());
   win.on('closed', () => {
-    win = null;
+    destroyShell(shell);
+    refreshMenuIfNeeded();
   });
 
-  // UI 页面只允许加载自身：拖入文件/链接不得让主窗口导航走（否则整个界面丢失）
   win.webContents.on('will-navigate', (e) => e.preventDefault());
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  win.webContents.on('did-finish-load', () => bootShell(shell));
+  return shell;
+}
 
-  win.webContents.on('did-finish-load', () => {
+/** 窗口界面加载完：主窗口恢复上次账号；后开的窗口打开指定账号的当前页 */
+function bootShell(shell: Shell): void {
+  if (shell.win.isDestroyed()) return;
+  if (shell.primary) {
     if (crashRecoveryPending) {
-      // 上次崩溃：不自动恢复标签页，横幅等用户选择（恢复 / 重新开始）
-      sendState();
+      sendState(shell);
       return;
     }
-    if (activeId === null && accounts.length > 0) {
-      // 直接恢复上次使用的账号，避免先白白加载第一个账号再切换
-      const vis = visibleAccounts();
+    if (shell.activeId === null && accounts.length > 0) {
+      const vis = visibleAccounts(shell);
       const target = vis.find((a) => a.id === savedActiveId) ?? vis[0];
-      if (target) switchAccount(target.id);
-      else sendState();
+      if (target) switchAccount(shell, target.id);
+      else sendState(shell);
     } else {
-      sendState();
+      sendState(shell);
     }
-  });
+    return;
+  }
+  const wanted = shell.bootAccountId;
+  const acc =
+    (wanted ? accounts.find((a) => a.id === wanted) : undefined) ?? visibleAccounts(shell)[0] ?? null;
+  if (!acc) {
+    sendState(shell);
+    return;
+  }
+  shell.activeBerthId = berthOfAccount(acc, berthIds());
+  const t = newTabRecord(shell.bootUrl);
+  shell.localTabs.set(acc.id, { tabs: [t], activeTabId: t.id });
+  switchAccount(shell, acc.id);
+}
+
+function destroyShell(shell: Shell): void {
+  for (const [tabId, view] of [...shell.views]) {
+    shell.views.delete(tabId);
+    prewarmedTabs.delete(tabId);
+    wcMap.delete(view.webContents.id);
+    if (!view.webContents.isDestroyed()) {
+      try {
+        view.webContents.close();
+      } catch {
+        /* 窗口正在拆 */
+      }
+    }
+  }
+  if (shell.primary) spareByAccount.clear();
+  for (const extra of [shell.berthOverlay, shell.findbar]) {
+    if (extra && !extra.webContents.isDestroyed()) {
+      try {
+        extra.webContents.close();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  const i = shells.indexOf(shell);
+  if (i >= 0) shells.splice(i, 1);
 }
 
 /* ---------- 应用生命周期 ---------- */
@@ -2352,10 +2689,11 @@ if (!gotLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    if (win) {
-      if (win.isMinimized()) win.restore();
-      win.focus();
-    }
+    const shell = focusedShell() ?? aliveShells()[0];
+    if (!shell) return;
+    if (shell.win.isMinimized()) shell.win.restore();
+    shell.win.show();
+    shell.win.focus();
   });
 
   app.whenReady().then(() => {
@@ -2382,14 +2720,15 @@ if (!gotLock) {
         console.log(
           `[workpier] vault init: available=${vault.available} failed=${vault.initFailed} entries=${vault.entries.length} never=${vault.never.length}`,
         );
-        buildMenu(); // vault 可用性可能影响菜单项，初始化完成后刷一次
-        sendState();
+        buildMenu();
+        sendStateAll();
       });
 
     registerIpc();
+    installDockMenu();
     buildMenu();
     applyPermissionPolicy(session.defaultSession);
-    createWindow();
+    createShell({ primary: true, startup: true });
     schedulePrewarm(15_000);
 
     // 启动 5s 后静默检查 GitHub 最新 Release：失败/无新版不打扰，有新版才提醒
