@@ -4,6 +4,23 @@ export interface Tab {
   title: string;
 }
 
+/** 收藏的网页（全局，不跟账号走；打开时进当前账号的当前标签） */
+export interface Bookmark {
+  id: string;
+  title: string;
+  /** 已去掉 hash 的 http(s) 地址，用来判断是不是同一页 */
+  url: string;
+  createdAt: number;
+}
+
+/** 新标签页上的快捷打开 */
+export interface QuickSite {
+  id: string;
+  name: string;
+  url: string;
+  color: string;
+}
+
 export interface Account {
   id: string;
   name: string;
@@ -63,6 +80,10 @@ export interface AppState {
   sidebarCollapsed: boolean;
   /** 上次未正常退出且用户尚未选择：渲染层显示「恢复上次会话」内嵌横幅 */
   crashRecovery: boolean;
+  /** 收藏夹（新的在前） */
+  bookmarks: Bookmark[];
+  /** 当前地址已在收藏夹里（起始页 / 非 http 地址为 false） */
+  bookmarked: boolean;
 }
 
 /** 密码条目元数据（不含密文/明文；镜像到主进程供菜单展示） */

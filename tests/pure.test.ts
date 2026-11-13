@@ -8,6 +8,12 @@ import {
   isHttpUrl,
   registrableDomain,
   reorderAccountsInBerth,
+  reorderTabs,
+  bookmarkKey,
+  sanitizeBookmarks,
+  normalizeSiteUrl,
+  sanitizeQuickSites,
+  DEFAULT_QUICK_SITES,
   findbarAnchor,
   resolveInput,
   sanitizeAccount,
@@ -362,5 +368,81 @@ describe('findbarAnchor 搜索栏落位', () => {
     const r = findbarAnchor({ x: 0, y: 0, width: 0, height: 0 }, 340, 42, 10);
     expect(r.width).toBe(0);
     expect(r.x).toBe(0);
+  });
+});
+
+const tab = (id: string): { id: string; url: string; title: string } => ({ id, url: '', title: id });
+
+describe('reorderTabs（标签拖拽重排）', () => {
+  const tabs = [tab('t1'), tab('t2'), tab('t3')];
+
+  it('完整新顺序会重排，标签对象本身不动', () => {
+    const next = reorderTabs(tabs, ['t3', 't1', 't2']);
+    expect(next.map((t) => t.id)).toEqual(['t3', 't1', 't2']);
+    expect(next[0]).toBe(tabs[2]);
+  });
+
+  it('顺序没变返回原数组', () => {
+    expect(reorderTabs(tabs, ['t1', 't2', 't3'])).toBe(tabs);
+  });
+
+  it('少一个、多一个、重复都拒绝', () => {
+    expect(reorderTabs(tabs, ['t2', 't1'])).toBe(tabs);
+    expect(reorderTabs(tabs, ['t1', 't2', 't3', 't4'])).toBe(tabs);
+    expect(reorderTabs(tabs, ['t1', 't1', 't2'])).toBe(tabs);
+  });
+
+  it('只有一个标签时不重排', () => {
+    const one = [tab('only')];
+    expect(reorderTabs(one, ['only'])).toBe(one);
+  });
+});
+
+describe('收藏与快捷打开', () => {
+  it('bookmarkKey 去掉 hash，非 http 地址不算', () => {
+    expect(bookmarkKey('https://github.com/login#top')).toBe('https://github.com/login');
+    expect(bookmarkKey('file:///tmp/a')).toBe('');
+    expect(bookmarkKey('不是网址')).toBe('');
+  });
+
+  it('sanitizeBookmarks 丢掉坏数据，同一地址只留第一条', () => {
+    const list = sanitizeBookmarks([
+      { id: 'a', title: ' GitHub ', url: 'https://github.com/login#x', createdAt: 1 },
+      { id: 'b', title: '重复', url: 'https://github.com/login', createdAt: 2 },
+      { id: 'bad id', title: 'x', url: 'https://example.com' },
+      { id: 'c', title: '', url: 'http://localhost:3000/app' },
+      'nope',
+    ]);
+    expect(list.map((b) => b.id)).toEqual(['a', 'c']);
+    expect(list[0].title).toBe('GitHub');
+    expect(list[0].url).toBe('https://github.com/login');
+    expect(list[1].title).toBe('http://localhost:3000/app');
+  });
+
+  it('normalizeSiteUrl 补 https，不接受一句话', () => {
+    expect(normalizeSiteUrl('github.com/login')).toBe('https://github.com/login');
+    expect(normalizeSiteUrl('http://127.0.0.1:8080/a')).toBe('http://127.0.0.1:8080/a');
+    expect(normalizeSiteUrl('腾讯云')).toBeNull();
+    expect(normalizeSiteUrl('')).toBeNull();
+  });
+
+  it('默认快捷打开能原样通过校验，空数组合法，非数组拒绝', () => {
+    const kept = sanitizeQuickSites(DEFAULT_QUICK_SITES);
+    expect(kept).toEqual(DEFAULT_QUICK_SITES);
+    expect(sanitizeQuickSites([])).toEqual([]);
+    expect(sanitizeQuickSites({ name: 'x' })).toBeNull();
+  });
+
+  it('快捷打开：去空名、去重、保留用户顺序', () => {
+    const list = sanitizeQuickSites([
+      { id: 'b', name: ' 文档 ', url: 'docs.example.com', color: 'red' },
+      { id: 'a', name: '仓库', url: 'https://github.com' },
+      { id: 'b', name: '重复 id', url: 'https://example.com' },
+      { id: 'z', name: '   ', url: 'https://example.com/z' },
+    ]);
+    expect(list?.map((s) => s.id)).toEqual(['b', 'a']);
+    expect(list?.[0].url).toBe('https://docs.example.com/');
+    expect(list?.[0].color).toBe(PALETTE[0]);
+    expect(list?.[0].name).toBe('文档');
   });
 });

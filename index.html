@@ -291,6 +291,38 @@
       background: transparent; font-size: 16px; color: #444E63; cursor: pointer;
     }
     .tab-new:hover { background: #E9EFF9; }
+    .tab.dragging { opacity: .35; }
+    .tab.drop-before { box-shadow: inset 3px 0 0 var(--blue); }
+    .tab.drop-after { box-shadow: inset -3px 0 0 var(--blue); }
+    #navStar.on svg { fill: #E8A317; stroke: #E8A317; }
+    #bookmarkPanel {
+      position: absolute; top: 56px; right: 16px; z-index: 30;
+      width: 320px; max-height: min(420px, 70vh); overflow: auto;
+      background: #fff; border: 1px solid var(--line); border-radius: 12px;
+      box-shadow: 0 10px 28px rgba(20, 40, 80, .16);
+      padding: 8px; -webkit-app-region: no-drag;
+    }
+    #bookmarkPanel[hidden] { display: none; }
+    .bm-head {
+      padding: 6px 8px 8px; font-size: 12px; font-weight: 600; color: #5C6B82;
+    }
+    .bm-empty { padding: 14px 10px 16px; font-size: 12px; color: #98A2B8; line-height: 1.6; }
+    .bm-item {
+      display: flex; align-items: center; gap: 8px;
+      padding: 7px 8px; border-radius: 8px; cursor: pointer;
+    }
+    .bm-item:hover { background: #F2F5FA; }
+    .bm-text { flex: 1; min-width: 0; }
+    .bm-title {
+      font-size: 13px; color: var(--text); white-space: nowrap;
+      overflow: hidden; text-overflow: ellipsis;
+    }
+    .bm-host { font-size: 11px; color: #98A2B8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .bm-del {
+      flex: none; width: 22px; height: 22px; border: 0; border-radius: 6px;
+      background: transparent; color: #98A2B8; cursor: pointer; font-size: 12px;
+    }
+    .bm-del:hover { background: #FDECEC; color: #E54545; }
 
     #empty {
       position: absolute; inset: 0; display: flex;
@@ -333,6 +365,12 @@
         <button id="navReload" class="tb-btn" title="刷新 (⌘R)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M19.5 12a7.5 7.5 0 1 1-2.4-5.5"/><polyline points="19.8 4.2 19.5 8.6 15.1 8.3"/></svg></button>
         <button id="navHome" class="tb-btn" title="账号首页"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11.2 12 4.5l8 6.7"/><path d="M6 10.2V19a1 1 0 0 0 1 1h3.5v-5h3v5H17a1 1 0 0 0 1-1v-8.8"/></svg></button>
         <input id="urlInput" placeholder="输入网址或搜索内容" spellcheck="false">
+        <button id="navStar" class="tb-btn" title="收藏此页 (⌘D)" disabled>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><polygon points="12 3.5 14.6 9 20.5 9.6 16.1 13.6 17.4 19.5 12 16.5 6.6 19.5 7.9 13.6 3.5 9.6 9.4 9"/></svg>
+        </button>
+        <button id="navMarks" class="tb-btn" title="收藏夹">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4.5h10a1 1 0 0 1 1 1V20l-6-3.2L6 20V5.5a1 1 0 0 1 1-1z"/></svg>
+        </button>
         <div id="activeBadge"></div>
         <div id="winControls">
           <button id="wcMin" title="最小化"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><line x1="5" y1="12" x2="19" y2="12"/></svg></button>

@@ -2,7 +2,7 @@
  * 纯函数模块：不依赖 electron / fs，可直接被 vitest 单测覆盖。
  * main.ts 与页面桥共用，保证解析/清洗规则只有一份实现。
  */
-import type { Account, Berth, Tab } from './types';
+import type { Account, Berth, Bookmark, QuickSite, Tab } from './types';
 
 export const PALETTE = [
   '#0052D9', '#00A870', '#ED7B2F', '#7B61FF',
@@ -131,6 +131,126 @@ export function resolveInput(raw: string): string | null {
 
 export function isHttpUrl(u: unknown): u is string {
   return typeof u === 'string' && /^https?:\/\//i.test(u);
+}
+
+/**
+ * 标签重排：orderedIds 必须恰好是当前标签 id 的完整新顺序。
+ * 少一个、多一个、重复、或顺序没变，都原样返回（引用不变）。
+ */
+export function reorderTabs(tabs: Tab[], orderedIds: string[]): Tab[] {
+  if (tabs.length < 2) return tabs;
+  const seen = new Set<string>();
+  for (const id of orderedIds) {
+    if (seen.has(id) || !tabs.some((t) => t.id === id)) return tabs;
+    seen.add(id);
+  }
+  if (seen.size !== tabs.length) return tabs;
+  const byId = new Map(tabs.map((t) => [t.id, t]));
+  const next = orderedIds.map((id) => byId.get(id)).filter((t): t is Tab => Boolean(t));
+  if (next.length !== tabs.length) return tabs;
+  if (next.every((t, i) => t === tabs[i])) return tabs;
+  return next;
+}
+
+/** 收藏去重键：只认 http(s)，去掉 hash。非法地址返回空串。 */
+export function bookmarkKey(url: string): string {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+    u.hash = '';
+    return u.href;
+  } catch {
+    return '';
+  }
+}
+
+const BOOKMARK_MAX = 200;
+
+/** 磁盘上的收藏。非数组当空；坏条目丢掉；同一地址只留第一条。 */
+export function sanitizeBookmarks(raw: unknown): Bookmark[] {
+  if (!Array.isArray(raw)) return [];
+  const out: Bookmark[] = [];
+  const seenUrl = new Set<string>();
+  const seenId = new Set<string>();
+  for (const item of raw) {
+    if (out.length >= BOOKMARK_MAX) break;
+    if (!item || typeof item !== 'object') continue;
+    const b = item as Partial<Bookmark>;
+    if (typeof b.id !== 'string' || !/^[\w-]{1,64}$/.test(b.id) || seenId.has(b.id)) continue;
+    if (typeof b.url !== 'string') continue;
+    const url = bookmarkKey(b.url);
+    if (!url || seenUrl.has(url)) continue;
+    seenId.add(b.id);
+    seenUrl.add(url);
+    const title = typeof b.title === 'string' ? b.title.trim().slice(0, 80) : '';
+    out.push({
+      id: b.id,
+      title: title || url,
+      url,
+      createdAt: typeof b.createdAt === 'number' ? b.createdAt : 0,
+    });
+  }
+  return out;
+}
+
+/** 快捷打开只收「像网址」的输入，不把一句话变成搜索。 */
+export function normalizeSiteUrl(raw: string): string | null {
+  const text = raw.trim();
+  if (!text || /\s/.test(text) || text.length > 2000) return null;
+  const withScheme = /^https?:\/\//i.test(text) ? text : `https://${text}`;
+  try {
+    const u = new URL(withScheme);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    const host = u.hostname;
+    if (host !== 'localhost' && !/^\d{1,3}(\.\d{1,3}){3}$/.test(host) && !host.includes('.')) return null;
+    return u.href;
+  } catch {
+    return null;
+  }
+}
+
+/** 新标签页默认快捷打开（与旧版写死的八个站点一致） */
+export const DEFAULT_QUICK_SITES: QuickSite[] = [
+  { id: 'tencent', name: '腾讯云', url: 'https://cloud.tencent.com/login?s_url=https%3A%2F%2Fconsole.cloud.tencent.com%2F', color: '#0052D9' },
+  { id: 'aliyun', name: '阿里云', url: 'https://account.aliyun.com/login/login.htm', color: '#ED7B2F' },
+  { id: 'aws', name: 'AWS', url: 'https://console.aws.amazon.com/', color: '#B58A00' },
+  { id: 'azure', name: 'Azure', url: 'https://portal.azure.com/', color: '#029BE5' },
+  { id: 'github', name: 'GitHub', url: 'https://github.com/login', color: '#24292F' },
+  { id: 'google', name: 'Google', url: 'https://accounts.google.com/', color: '#E3737B' },
+  { id: 'microsoft', name: 'Microsoft', url: 'https://login.microsoftonline.com/', color: '#7B61FF' },
+  { id: 'notion', name: 'Notion', url: 'https://www.notion.so/login', color: '#2E7D32' },
+];
+
+const QUICK_SITE_MAX = 24;
+
+/**
+ * 校验快捷打开列表。不是数组返回 null（调用方保留原列表）；
+ * 空数组是合法的（用户把快捷方式全删了）。
+ */
+export function sanitizeQuickSites(raw: unknown): QuickSite[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out: QuickSite[] = [];
+  const seenId = new Set<string>();
+  const seenUrl = new Set<string>();
+  for (const item of raw) {
+    if (out.length >= QUICK_SITE_MAX) break;
+    if (!item || typeof item !== 'object') continue;
+    const s = item as Partial<QuickSite>;
+    if (typeof s.id !== 'string' || !/^[\w-]{1,64}$/.test(s.id) || seenId.has(s.id)) continue;
+    if (typeof s.name !== 'string') continue;
+    const name = s.name.trim().slice(0, 16);
+    if (!name) continue;
+    if (typeof s.url !== 'string') continue;
+    const url = normalizeSiteUrl(s.url);
+    if (!url || seenUrl.has(url)) continue;
+    seenId.add(s.id);
+    seenUrl.add(url);
+    const color = typeof s.color === 'string' && /^#[0-9a-f]{6}$/i.test(s.color)
+      ? s.color
+      : PALETTE[out.length % PALETTE.length];
+    out.push({ id: s.id, name, url, color });
+  }
+  return out;
 }
 
 /** 对磁盘读入的数据做结构/类型校验，脏数据不会拖垮渲染或会话分区 */

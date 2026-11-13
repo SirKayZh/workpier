@@ -17,8 +17,63 @@ function place() {
   panel.style.visibility = 'visible';
 }
 
+function hostOf(url) {
+  try { return new URL(url).host; } catch (_) { return url; }
+}
+
+function placeBookmarks() {
+  const { anchor } = data;
+  const width = 320;
+  panel.classList.add('marks');
+  panel.style.width = width + 'px';
+  panel.style.left = Math.max(8, anchor.x + anchor.w - width) + 'px';
+  panel.style.top = anchor.y + anchor.h + 6 + 'px';
+  panel.style.visibility = 'visible';
+}
+
+function renderBookmarks() {
+  panel.classList.add('marks');
+  const t = document.createElement('div');
+  t.className = 'title';
+  t.textContent = '收藏';
+  panel.appendChild(t);
+  const list = data.bookmarks || [];
+  if (list.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = '还没有收藏。打开网页后点星星即可收藏。';
+    panel.appendChild(empty);
+    placeBookmarks();
+    return;
+  }
+  list.forEach((b) => {
+    const item = document.createElement('div');
+    item.className = 'item';
+    item.innerHTML = `<span class="bm-text"><span class="bm-title">${esc(b.title || b.url)}</span><span class="bm-host">${esc(hostOf(b.url))}</span></span>`;
+    item.addEventListener('click', () => window.overlayApi.openBookmark(b.url));
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'bm-del';
+    del.title = '取消收藏';
+    del.textContent = '✕';
+    del.addEventListener('click', (e) => {
+      e.stopPropagation();
+      window.overlayApi.removeBookmark(b.id);
+    });
+    item.appendChild(del);
+    panel.appendChild(item);
+  });
+  placeBookmarks();
+}
+
 function render() {
   if (!data) return;
+  panel.classList.remove('marks');
+  if (data.kind === 'bookmarks') {
+    panel.innerHTML = '';
+    renderBookmarks();
+    return;
+  }
   panel.innerHTML = '';
   const t = document.createElement('div');
   t.className = 'title';

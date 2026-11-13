@@ -25,6 +25,16 @@ contextBridge.exposeInMainWorld('api', {
   newTab: (url?: string): Promise<boolean> => ipcRenderer.invoke('tabs:new', url),
   closeTab: (tabId: string): Promise<boolean> => ipcRenderer.invoke('tabs:close', tabId),
   switchTab: (tabId: string): Promise<boolean> => ipcRenderer.invoke('tabs:switch', tabId),
+  /** 拖拽排序：orderedIds = 当前窗口当前账号标签的完整新顺序 */
+  reorderTabs: (orderedIds: string[]): Promise<boolean> => ipcRenderer.invoke('tabs:reorder', orderedIds),
+  toggleBookmark: (): Promise<boolean> => ipcRenderer.invoke('bookmarks:toggle'),
+  removeBookmark: (id: string): Promise<boolean> => ipcRenderer.invoke('bookmarks:remove', id),
+  /** 收藏夹浮层：盖在网页上面。anchor 是书签按钮在窗口里的矩形 */
+  bookmarkPanelToggle: (anchor: { x: number; y: number; w: number; h: number }): Promise<boolean> =>
+    ipcRenderer.invoke('bookmarks:panel-toggle', anchor),
+  onBookmarkPanel: (cb: (open: boolean) => void): void => {
+    ipcRenderer.on('bookmarks:panel', (_event, open: unknown) => cb(Boolean(open)));
+  },
   nav: (action: 'back' | 'forward' | 'reload' | 'stop' | 'home'): Promise<void> =>
     ipcRenderer.invoke('nav:action', action),
   openUrl: (url: string): Promise<boolean> => ipcRenderer.invoke('nav:url', url),

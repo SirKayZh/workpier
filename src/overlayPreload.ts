@@ -2,10 +2,12 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type { Berth } from './types';
 
 export interface OverlayInit {
-  berths: Berth[];
-  activeBerthId: string;
+  kind?: 'berth' | 'bookmarks';
+  berths?: Berth[];
+  activeBerthId?: string;
   anchor: { x: number; y: number; w: number; h: number };
-  collapsed: boolean;
+  collapsed?: boolean;
+  bookmarks?: Array<{ id: string; title: string; url: string }>;
 }
 
 /** 工作区下拉浮层（盖在网页视图之上的透明全窗口视图）可用的受限 API */
@@ -22,4 +24,6 @@ contextBridge.exposeInMainWorld('overlayApi', {
   addBerth: (name: string): Promise<unknown> => ipcRenderer.invoke('berths:add', name),
   renameBerth: (id: string, name: string): Promise<boolean> => ipcRenderer.invoke('berths:rename', id, name),
   menu: (id: string): Promise<void> => ipcRenderer.invoke('berths:menu', id),
+  openBookmark: (url: string): Promise<boolean> => ipcRenderer.invoke('bookmarks:open', url),
+  removeBookmark: (id: string): Promise<boolean> => ipcRenderer.invoke('bookmarks:remove', id),
 });

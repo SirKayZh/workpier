@@ -8,6 +8,7 @@
  * 注意：sandbox 预加载脚本只能 require('electron')，所以保持单文件、不引用本地模块。
  */
 import { contextBridge, ipcRenderer } from 'electron';
+import type { QuickSite } from './types';
 
 const TEXT_SEL =
   'input:not([type]), input[type="text"], input[type="email"], input[type="tel"], input[type="number"], input[type="search"]';
@@ -212,4 +213,10 @@ else start();
  */
 contextBridge.exposeInMainWorld('workpierStart', {
   open: (raw: string): Promise<boolean> => ipcRenderer.invoke('nav:start-input', raw),
+  quickSites: (): Promise<QuickSite[] | null> => ipcRenderer.invoke('start:quick-sites'),
+  saveQuickSites: (sites: unknown): Promise<QuickSite[] | null> => ipcRenderer.invoke('start:quick-sites-save', sites),
+  resetQuickSites: (): Promise<QuickSite[] | null> => ipcRenderer.invoke('start:quick-sites-reset'),
+  onQuickSites: (cb: (sites: QuickSite[]) => void): void => {
+    ipcRenderer.on('start:quick-sites', (_event, sites: QuickSite[]) => cb(sites));
+  },
 });

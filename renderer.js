@@ -39,6 +39,8 @@ const els = {
   fwd: document.getElementById('navFwd'),
   reload: document.getElementById('navReload'),
   home: document.getElementById('navHome'),
+  star: document.getElementById('navStar'),
+  marks: document.getElementById('navMarks'),
   url: document.getElementById('urlInput'),
   badge: document.getElementById('activeBadge'),
   addBtn: document.getElementById('btnAdd'),
@@ -63,6 +65,8 @@ let state = {
   pending: null,
   sidebarCollapsed: false,
   crashRecovery: false,
+  bookmarks: [],
+  bookmarked: false,
 };
 let editing = false; // 添加/重命名进行中时跳过列表重渲染
 
@@ -136,6 +140,32 @@ window.api.onBerthPanel((open) => {
 });
 
 let tabSig = '';
+/** 正在拖的标签。拖的过程中不重建标签栏，否则落点会丢。 */
+let dragTabId = null;
+
+function clearTabDropMarks() {
+  els.tablist.querySelectorAll('.drop-before,.drop-after').forEach((el) => {
+    el.classList.remove('drop-before');
+    el.classList.remove('drop-after');
+  });
+}
+
+async function commitTabReorder(targetId, before) {
+  const acc = activeAccount();
+  if (!dragTabId || !acc) return;
+  const ids = acc.tabs.map((t) => t.id);
+  const from = ids.indexOf(dragTabId);
+  if (from < 0) return;
+  ids.splice(from, 1);
+  let at = ids.length;
+  if (targetId && targetId !== dragTabId) {
+    const ti = ids.indexOf(targetId);
+    if (ti >= 0) at = before ? ti : ti + 1;
+  }
+  ids.splice(at, 0, dragTabId);
+  const old = acc.tabs.map((t) => t.id).join(',');
+  if (ids.join(',') !== old) await window.api.reorderTabs(ids);
+}
 
 function renderTabbar() {
   const acc = activeAccount();
@@ -144,6 +174,7 @@ function renderTabbar() {
     tabSig = '';
     return;
   }
+  if (dragTabId) return;
   // 签名未变则不重建 DOM：页面加载过程中状态推送很频繁，
   // 重建会让 mousedown→mouseup 之间的点击丢失
   const sig = JSON.stringify([acc.id, state.activeTabId, acc.tabs.map((t) => [t.id, t.title, t.url])]);
@@ -164,6 +195,8 @@ function renderTabbar() {
       if (e.button !== 0 || e.target.classList.contains('tab-close')) return;
       window.api.switchTab(tab.id);
     });
+    let blockDrag = false;
+    el.querySelector('.tab-close').addEventListener('mousedown', () => { blockDrag = true; });
     el.querySelector('.tab-close').addEventListener('click', (e) => {
       e.stopPropagation();
       window.api.closeTab(tab.id);
@@ -171,12 +204,58 @@ function renderTabbar() {
     el.addEventListener('auxclick', (e) => {
       if (e.button === 1) window.api.closeTab(tab.id);
     });
+    el.draggable = true;
+    el.addEventListener('dragstart', (e) => {
+      if (blockDrag) {
+        blockDrag = false;
+        e.preventDefault();
+        return;
+      }
+      dragTabId = tab.id;
+      e.dataTransfer.effectAllowed = 'move';
+      try { e.dataTransfer.setData('text/plain', tab.id); } catch (_) { /* 部分环境不允许自定义数据 */ }
+      el.classList.add('dragging');
+    });
+    el.addEventListener('dragend', () => {
+      el.classList.remove('dragging');
+      clearTabDropMarks();
+      dragTabId = null;
+      tabSig = '';
+      renderTabbar();
+    });
+    el.addEventListener('dragover', (e) => {
+      if (!dragTabId) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      const rect = el.getBoundingClientRect();
+      const before = e.clientX < rect.left + rect.width / 2;
+      clearTabDropMarks();
+      el.classList.add(before ? 'drop-before' : 'drop-after');
+    });
+    el.addEventListener('drop', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const rect = el.getBoundingClientRect();
+      const before = e.clientX < rect.left + rect.width / 2;
+      commitTabReorder(tab.id, before);
+    });
     els.tablist.appendChild(el);
     if (isActive) activeEl = el;
   });
   // tab 很多时保证活跃 tab 可见
   if (activeEl) activeEl.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 }
+
+els.tablist.addEventListener('dragover', (e) => {
+  if (!dragTabId) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+});
+els.tablist.addEventListener('drop', (e) => {
+  if (e.target !== els.tablist) return;
+  e.preventDefault();
+  commitTabReorder(null, false);
+});
 
 let bannerSig = '';
 
@@ -228,6 +307,9 @@ function renderBanner() {
 function renderToolbar() {
   els.back.disabled = !state.canGoBack;
   els.fwd.disabled = !state.canGoForward;
+  els.star.disabled = !state.url;
+  els.star.classList.toggle('on', !!state.bookmarked);
+  els.star.title = modHint(state.bookmarked ? '取消收藏 (⌘D)' : '收藏此页 (⌘D)');
   if (document.activeElement !== els.url) {
     els.url.value = state.url;
   }
@@ -410,6 +492,14 @@ els.back.addEventListener('click', () => window.api.nav('back'));
 els.fwd.addEventListener('click', () => window.api.nav('forward'));
 els.reload.addEventListener('click', () => window.api.nav('reload'));
 els.home.addEventListener('click', () => window.api.nav('home'));
+els.star.addEventListener('click', () => window.api.toggleBookmark());
+els.marks.addEventListener('click', () => {
+  const r = els.marks.getBoundingClientRect();
+  window.api.bookmarkPanelToggle({ x: r.left, y: r.top, w: r.width, h: r.height });
+});
+window.api.onBookmarkPanel((open) => {
+  els.marks.classList.toggle('on', open);
+});
 document.getElementById('sbToggle').addEventListener('click', () => window.api.toggleSidebar());
 
 // 主菜单 / 右键菜单的「重命名」

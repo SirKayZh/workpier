@@ -33,6 +33,34 @@
       transition: border-color .15s, box-shadow .15s, transform .15s;
     }
     .site:hover { border-color: #0052D9; box-shadow: 0 2px 10px rgba(0, 82, 217, .12); transform: translateY(-1px); }
+    .site { position: relative; }
+    .site.editing { cursor: grab; }
+    .site.dragging { opacity: .4; }
+    .site.drop-before { outline: 2px solid #0052D9; }
+    .site .x {
+      position: absolute; top: 4px; right: 4px; width: 18px; height: 18px;
+      border: 0; border-radius: 50%; background: #F2F3F5; color: #4E5969;
+      cursor: pointer; font-size: 12px; line-height: 18px; padding: 0;
+    }
+    .site .x:hover { background: #FDECEC; color: #E54545; }
+    .editbar { display: none; gap: 8px; margin-top: 14px; }
+    .editbar:not([hidden]) { display: flex; }
+    .editbar input {
+      height: 36px; padding: 0 10px; font-size: 13px;
+      border: 1px solid #DCDFE6; border-radius: 8px; outline: none; background: #fff;
+    }
+    .editbar input:first-child { width: 96px; flex: none; }
+    .editbar input:nth-child(2) { flex: 1; min-width: 0; }
+    .editbar button, .edit-toggle, .reset {
+      height: 36px; padding: 0 12px; border-radius: 8px; border: 1px solid #DCDFE6;
+      background: #fff; font-size: 13px; cursor: pointer; color: #1D2129;
+    }
+    .editbar button.primary, .edit-toggle {
+      border: 0; background: transparent; color: #0052D9;
+    }
+    .edit-toggle { margin-top: 8px; }
+    .editbar button:hover, .reset:hover { border-color: #0052D9; color: #0052D9; }
+    .edit-hint { margin-top: 8px; font-size: 12px; color: #A9AEB8; }
     .ico {
       width: 36px; height: 36px; border-radius: 9px; color: #fff;
       display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 16px;
@@ -49,42 +77,184 @@
       <button class="go" type="submit">打开</button>
     </form>
     <div class="grid" id="grid"></div>
+    <div class="editbar" id="editbar" hidden>
+      <input id="addName" placeholder="名称" maxlength="16" spellcheck="false">
+      <input id="addUrl" placeholder="网址，如 github.com" maxlength="500" spellcheck="false">
+      <button type="button" id="addSite" class="primary">添加</button>
+      <button type="button" id="resetSites" class="reset">恢复默认</button>
+    </div>
+    <div class="edit-hint" id="editHint" hidden>拖动卡片调整顺序，点 × 移除。改动会记住。</div>
+    <button type="button" id="editBtn" class="edit-toggle">自定义</button>
     <div class="tip">登录成功后，账号会自动按用户名 / 站点命名；<br>同一个网站可以在不同账号里分别登录不同的用户。</div>
   </div>
   <script>
     'use strict';
-    var SITES = [
-      ['腾讯云', 'https://cloud.tencent.com/login?s_url=https%3A%2F%2Fconsole.cloud.tencent.com%2F', '#0052D9'],
-      ['阿里云', 'https://account.aliyun.com/login/login.htm', '#ED7B2F'],
-      ['AWS', 'https://console.aws.amazon.com/', '#B58A00'],
-      ['Azure', 'https://portal.azure.com/', '#029BE5'],
-      ['GitHub', 'https://github.com/login', '#24292F'],
-      ['Google', 'https://accounts.google.com/', '#E3737B'],
-      ['Microsoft', 'https://login.microsoftonline.com/', '#7B61FF'],
-      ['Notion', 'https://www.notion.so/login', '#2E7D32']
-    ];
+    var PALETTE = ['#0052D9', '#00A870', '#ED7B2F', '#7B61FF', '#E3737B', '#029BE5', '#B58A00', '#2E7D32'];
+    var sites = [];
+    var editing = false;
+    var dragId = null;
     var grid = document.getElementById('grid');
-    SITES.forEach(function (s) {
-      var a = document.createElement('a');
-      a.className = 'site';
-      a.href = s[1];
-      var ico = document.createElement('span');
-      ico.className = 'ico';
-      ico.style.background = s[2];
-      ico.textContent = s[0].slice(0, 1).toUpperCase();
-      var name = document.createElement('span');
-      name.textContent = s[0];
-      a.appendChild(ico);
-      a.appendChild(name);
-      grid.appendChild(a);
+    var editbar = document.getElementById('editbar');
+    var editHint = document.getElementById('editHint');
+    var editBtn = document.getElementById('editBtn');
+
+    function copySites(list) {
+      return (list || []).map(function (s) {
+        return { id: s.id, name: s.name, url: s.url, color: s.color };
+      });
+    }
+
+    function clearDrop() {
+      grid.querySelectorAll('.drop-before').forEach(function (el) { el.classList.remove('drop-before'); });
+    }
+
+    function render() {
+      grid.innerHTML = '';
+      editbar.hidden = !editing;
+      editHint.hidden = !editing;
+      editBtn.textContent = editing ? '完成' : '自定义';
+      sites.forEach(function (s) {
+        var el = document.createElement(editing ? 'div' : 'a');
+        el.className = 'site' + (editing ? ' editing' : '');
+        el.dataset.id = s.id;
+        if (!editing) el.href = s.url;
+        var ico = document.createElement('span');
+        ico.className = 'ico';
+        ico.style.background = s.color || '#0052D9';
+        ico.textContent = String(s.name || '?').slice(0, 1).toUpperCase();
+        var name = document.createElement('span');
+        name.textContent = s.name;
+        el.appendChild(ico);
+        el.appendChild(name);
+        if (editing) {
+          var x = document.createElement('button');
+          x.type = 'button';
+          x.className = 'x';
+          x.textContent = '×';
+          x.title = '移除';
+          x.addEventListener('click', function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            sites = sites.filter(function (it) { return it.id !== s.id; });
+            persist();
+          });
+          el.appendChild(x);
+          el.draggable = true;
+          el.addEventListener('dragstart', function (e) {
+            if (e.target.classList && e.target.classList.contains('x')) {
+              e.preventDefault();
+              return;
+            }
+            dragId = s.id;
+            e.dataTransfer.effectAllowed = 'move';
+            el.classList.add('dragging');
+          });
+          el.addEventListener('dragend', function () {
+            el.classList.remove('dragging');
+            clearDrop();
+            dragId = null;
+          });
+          el.addEventListener('dragover', function (e) {
+            if (!dragId || dragId === s.id) return;
+            e.preventDefault();
+            e.stopPropagation();
+            clearDrop();
+            el.classList.add('drop-before');
+          });
+          el.addEventListener('drop', function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            var rect = el.getBoundingClientRect();
+            var before = e.clientX < rect.left + rect.width / 2;
+            moveSite(dragId, s.id, before);
+          });
+        }
+        grid.appendChild(el);
+      });
+    }
+
+    grid.addEventListener('dragover', function (e) {
+      if (!editing || !dragId) return;
+      e.preventDefault();
+    });
+    grid.addEventListener('drop', function (e) {
+      if (!editing || e.target !== grid) return;
+      e.preventDefault();
+      moveSite(dragId, null, false);
     });
 
-    // 输入解析走主进程（与地址栏同一套 resolveInput 规则），本地不再放拷贝
+    function moveSite(fromId, toId, before) {
+      if (!fromId || fromId === toId) return;
+      var from = sites.findIndex(function (s) { return s.id === fromId; });
+      if (from < 0) return;
+      var item = sites.splice(from, 1)[0];
+      var at = sites.length;
+      if (toId) {
+        var to = sites.findIndex(function (s) { return s.id === toId; });
+        if (to >= 0) at = before ? to : to + 1;
+      }
+      sites.splice(at, 0, item);
+      persist();
+    }
+
+    function newId() {
+      return 'q' + Math.random().toString(16).slice(2, 10);
+    }
+
+    async function persist() {
+      var api = window.workpierStart;
+      if (!api) { render(); return; }
+      var saved = await api.saveQuickSites(sites);
+      if (saved) sites = copySites(saved);
+      render();
+    }
+
+    editBtn.addEventListener('click', function () {
+      editing = !editing;
+      render();
+    });
+
+    document.getElementById('addSite').addEventListener('click', function () {
+      var name = document.getElementById('addName').value.trim();
+      var url = document.getElementById('addUrl').value.trim();
+      if (!name || !url) return;
+      sites.push({
+        id: newId(),
+        name: name.slice(0, 16),
+        url: url,
+        color: PALETTE[sites.length % PALETTE.length]
+      });
+      document.getElementById('addName').value = '';
+      document.getElementById('addUrl').value = '';
+      persist();
+    });
+
+    document.getElementById('resetSites').addEventListener('click', async function () {
+      var api = window.workpierStart;
+      if (!api) return;
+      var saved = await api.resetQuickSites();
+      if (saved) sites = copySites(saved);
+      render();
+    });
+
     document.getElementById('f').addEventListener('submit', function (e) {
       e.preventDefault();
       var api = window.workpierStart;
       if (api) api.open(document.getElementById('q').value);
     });
+
+    var api = window.workpierStart;
+    if (api) {
+      api.onQuickSites(function (next) {
+        if (editing) return;
+        sites = copySites(next);
+        render();
+      });
+      api.quickSites().then(function (list) {
+        if (list) sites = copySites(list);
+        render();
+      });
+    }
   </script>
 </body>
 </html>

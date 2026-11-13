@@ -17,10 +17,11 @@ import * as fs from 'node:fs';
 import * as dns from 'node:dns';
 import { randomBytes } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import type { Account, AppState, Berth, CapturedLogin, FillPayload, PendingSave, Tab } from './types';
+import type { Account, AppState, Berth, Bookmark, CapturedLogin, FillPayload, PendingSave, QuickSite, Tab } from './types';
 import {
   PALETTE,
   DEFAULT_BERTH_ID,
+  DEFAULT_QUICK_SITES,
   berthOfAccount,
   sanitizeBerth,
   hostnameOf,
@@ -31,6 +32,10 @@ import {
   isHttpUrl,
   sanitizeAccount,
   reorderAccountsInBerth,
+  reorderTabs,
+  bookmarkKey,
+  sanitizeBookmarks,
+  sanitizeQuickSites,
   findbarAnchor,
 } from './pure';
 import { vault } from './vaultClient';
@@ -90,6 +95,8 @@ interface Shell {
   berthOverlay: WebContentsView | null;
   berthOverlayOpen: boolean;
   berthOverlayAnchor: BerthAnchor;
+  /** 同一个浮层两种内容：工作区下拉 / 收藏夹。网页是原生视图，普通 DOM 盖不住。 */
+  overlayKind: 'berth' | 'bookmarks';
   findbar: WebContentsView | null;
   findbarOpen: boolean;
   findText: string;
@@ -125,6 +132,10 @@ function focusedShell(): Shell | null {
 }
 
 let accounts: Account[] = [];
+/** 收藏夹：全局一份，打开时进当前窗口的当前标签 */
+let bookmarks: Bookmark[] = [];
+/** 新标签页快捷打开。文件不存在时用内置八个站点 */
+let quickSites: QuickSite[] = DEFAULT_QUICK_SITES.map((s) => ({ ...s }));
 
 /* ---------- 工作区（Berth） ---------- */
 
@@ -285,6 +296,14 @@ function uiFile(): string {
   return path.join(app.getPath('userData'), 'ui.json');
 }
 
+function bookmarksFile(): string {
+  return path.join(app.getPath('userData'), 'bookmarks.json');
+}
+
+function quickSitesFile(): string {
+  return path.join(app.getPath('userData'), 'quick-sites.json');
+}
+
 /** 原子写：先写临时文件再 rename，避免崩溃/断电写一半导致账号列表损坏丢失 */
 function writeFileAtomic(file: string, content: string, mode?: number): void {
   const tmp = `${file}.tmp`;
@@ -350,6 +369,84 @@ function scheduleSave(): void {
 /** 对磁盘读入的数据做结构/类型校验（实现见 pure.ts，可单测） */
 
 let savedActiveId: string | null = null;
+
+function saveBookmarksNow(): void {
+  try {
+    const file = bookmarksFile();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    writeFileAtomic(file, JSON.stringify(bookmarks, null, 2));
+  } catch (err) {
+    console.error('[workpier] save bookmarks failed:', err);
+  }
+}
+
+function saveQuickSitesNow(): void {
+  try {
+    const file = quickSitesFile();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    writeFileAtomic(file, JSON.stringify(quickSites, null, 2));
+  } catch (err) {
+    console.error('[workpier] save quick sites failed:', err);
+  }
+}
+
+function backupCorrupt(file: string): void {
+  try {
+    fs.copyFileSync(file, `${file}.corrupt-${Date.now()}`);
+  } catch {
+    /* ignore */
+  }
+}
+
+function loadBookmarks(): void {
+  const file = bookmarksFile();
+  if (!fs.existsSync(file)) {
+    bookmarks = [];
+    return;
+  }
+  try {
+    bookmarks = sanitizeBookmarks(JSON.parse(fs.readFileSync(file, 'utf-8')));
+  } catch (err) {
+    bookmarks = [];
+    backupCorrupt(file);
+    console.error('[workpier] bookmarks.json 解析失败，已备份:', err);
+  }
+}
+
+function loadQuickSites(): void {
+  const file = quickSitesFile();
+  if (!fs.existsSync(file)) {
+    quickSites = DEFAULT_QUICK_SITES.map((s) => ({ ...s }));
+    return;
+  }
+  try {
+    const parsed = sanitizeQuickSites(JSON.parse(fs.readFileSync(file, 'utf-8')));
+    if (!parsed) {
+      backupCorrupt(file);
+      quickSites = DEFAULT_QUICK_SITES.map((s) => ({ ...s }));
+      return;
+    }
+    quickSites = parsed;
+  } catch (err) {
+    backupCorrupt(file);
+    quickSites = DEFAULT_QUICK_SITES.map((s) => ({ ...s }));
+    console.error('[workpier] quick-sites.json 解析失败，已备份:', err);
+  }
+}
+
+/** 正在看起始页的标签收到新的快捷打开列表 */
+function notifyQuickSites(): void {
+  const payload = quickSites.map((s) => ({ ...s }));
+  for (const s of aliveShells()) {
+    for (const view of s.views.values()) {
+      try {
+        if (isStartUrl(view.webContents.getURL())) view.webContents.send('start:quick-sites', payload);
+      } catch {
+        /* 视图正在销毁 */
+      }
+    }
+  }
+}
 
 function loadAccounts(): void {
   const file = accountsFile();
@@ -933,6 +1030,14 @@ function activeWc(shell: Shell): WebContents | null {
   return shell.views.get(tab.id)?.webContents ?? null;
 }
 
+/** 当前标签正在看的 http(s) 地址。起始页和 about:blank 算没有。 */
+function shellPageUrl(shell: Shell): string {
+  const tab = activeTab(shell);
+  const wc = tab ? shell.views.get(tab.id)?.webContents : undefined;
+  if (wc && isHttpUrl(wc.getURL())) return wc.getURL();
+  return tab && isHttpUrl(tab.url) ? tab.url : '';
+}
+
 function sendState(shell: Shell): void {
   if (shell.win.isDestroyed()) return;
   const tab = activeTab(shell);
@@ -940,13 +1045,15 @@ function sendState(shell: Shell): void {
   const acc = activeAccount(shell);
   const title = acc ? `WorkPier — ${acc.name}` : 'WorkPier — 网页工作台';
   if (shell.win.getTitle() !== title) shell.win.setTitle(title);
+  const page = shellPageUrl(shell);
+  const pageKey = bookmarkKey(page);
   const state: AppState = {
     accounts: projectAccounts(shell),
     berths,
     activeBerthId: shell.activeBerthId,
     activeId: shell.activeId,
     activeTabId: tab?.id ?? null,
-    url: wc ? (isHttpUrl(wc.getURL()) ? wc.getURL() : '') : tab?.url ?? '',
+    url: page,
     title: wc ? wc.getTitle() : tab?.title ?? '',
     canGoBack: wc ? wc.navigationHistory.canGoBack() : false,
     canGoForward: wc ? wc.navigationHistory.canGoForward() : false,
@@ -954,6 +1061,8 @@ function sendState(shell: Shell): void {
     pending: pendingForUi(shell),
     sidebarCollapsed: shell.sidebarCollapsed,
     crashRecovery: shell.primary && crashRecoveryPending,
+    bookmarks,
+    bookmarked: pageKey !== '' && bookmarks.some((b) => bookmarkKey(b.url) === pageKey),
   };
   refreshMenuIfNeeded();
   shell.win.webContents.send('state:update', state);
@@ -1388,6 +1497,59 @@ function closeTab(shell: Shell, tabId: string): boolean {
   return true;
 }
 
+/** 拖动标签：只改当前窗口里当前账号的顺序。主窗口会落盘。 */
+function applyTabOrder(shell: Shell, orderedIds: string[]): boolean {
+  const acc = activeAccount(shell);
+  if (!acc) return false;
+  const b = bag(shell, acc);
+  const next = reorderTabs(b.tabs, orderedIds);
+  if (next === b.tabs) return false;
+  b.tabs = next;
+  if (shell.primary) scheduleSave();
+  sendState(shell);
+  return true;
+}
+
+function toggleBookmark(shell: Shell): boolean {
+  const url = bookmarkKey(shellPageUrl(shell));
+  if (!url) return false;
+  const idx = bookmarks.findIndex((b) => bookmarkKey(b.url) === url);
+  if (idx >= 0) {
+    bookmarks.splice(idx, 1);
+  } else {
+    const wc = activeWc(shell);
+    let title = (wc?.getTitle() || '').trim();
+    if (!title || title === '新标签页') title = siteLabel(url) || url;
+    bookmarks.unshift({
+      id: randomBytes(6).toString('hex'),
+      title: title.slice(0, 80),
+      url,
+      createdAt: Date.now(),
+    });
+    if (bookmarks.length > 200) bookmarks.length = 200;
+  }
+  saveBookmarksNow();
+  sendStateAll();
+  refreshBookmarkOverlays();
+  return true;
+}
+
+function removeBookmark(id: string): boolean {
+  const idx = bookmarks.findIndex((b) => b.id === id);
+  if (idx < 0) return false;
+  bookmarks.splice(idx, 1);
+  saveBookmarksNow();
+  sendStateAll();
+  refreshBookmarkOverlays();
+  return true;
+}
+
+function isStartSender(sender: WebContents): boolean {
+  const ctx = wcMap.get(sender.id);
+  if (!ctx || !accounts.includes(ctx.acc)) return false;
+  return isStartUrl(sender.getURL());
+}
+
 function cycleTab(shell: Shell, delta: number): void {
   const acc = activeAccount(shell);
   if (!acc) return;
@@ -1750,45 +1912,84 @@ function overlayBounds(shell: Shell): Rectangle {
 
 function sendBerthOverlayInit(shell: Shell): void {
   if (!shell.berthOverlay || !shell.berthOverlayOpen || shell.berthOverlay.webContents.isDestroyed()) return;
+  const anchor = shell.berthOverlayAnchor;
+  if (shell.overlayKind === 'bookmarks') {
+    shell.berthOverlay.webContents.send('overlay:init', {
+      kind: 'bookmarks',
+      anchor,
+      bookmarks: bookmarks.map((b) => ({ ...b })),
+    });
+    return;
+  }
   shell.berthOverlay.webContents.send('overlay:init', {
+    kind: 'berth',
     berths,
     activeBerthId: shell.activeBerthId,
-    anchor: shell.berthOverlayAnchor,
+    anchor,
     collapsed: shell.sidebarCollapsed,
   });
 }
 
+function refreshBookmarkOverlays(): void {
+  for (const s of aliveShells()) {
+    if (s.berthOverlayOpen && s.overlayKind === 'bookmarks') sendBerthOverlayInit(s);
+  }
+}
+
+function ensureOverlayView(shell: Shell): WebContentsView {
+  if (shell.berthOverlay) return shell.berthOverlay;
+  shell.berthOverlay = new WebContentsView({
+    webPreferences: {
+      preload: path.join(__dirname, 'overlayPreload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  shell.berthOverlay.setBackgroundColor('#00000000');
+  const wc = shell.berthOverlay.webContents;
+  wc.on('will-navigate', (e) => e.preventDefault());
+  wc.setWindowOpenHandler(() => ({ action: 'deny' }));
+  void wc.loadFile(path.join(__dirname, '..', 'overlay.html'));
+  return shell.berthOverlay;
+}
+
 function openBerthOverlay(shell: Shell, anchor: BerthAnchor): void {
   if (shell.win.isDestroyed()) return;
-  if (!shell.berthOverlay) {
-    shell.berthOverlay = new WebContentsView({
-      webPreferences: {
-        preload: path.join(__dirname, 'overlayPreload.js'),
-        contextIsolation: true,
-        nodeIntegration: false,
-      },
-    });
-    shell.berthOverlay.setBackgroundColor('#00000000');
-    const wc = shell.berthOverlay.webContents;
-    wc.on('will-navigate', (e) => e.preventDefault());
-    wc.setWindowOpenHandler(() => ({ action: 'deny' }));
-    void wc.loadFile(path.join(__dirname, '..', 'overlay.html'));
-  }
+  const view = ensureOverlayView(shell);
+  const prevKind = shell.berthOverlayOpen ? shell.overlayKind : null;
+  shell.overlayKind = 'berth';
   shell.berthOverlayAnchor = anchor;
   shell.berthOverlayOpen = true;
-  shell.win.contentView.addChildView(shell.berthOverlay);
-  shell.berthOverlay.setBounds(overlayBounds(shell));
+  shell.win.contentView.addChildView(view);
+  view.setBounds(overlayBounds(shell));
   sendBerthOverlayInit(shell);
-  shell.berthOverlay.webContents.focus();
+  view.webContents.focus();
+  if (prevKind === 'bookmarks') shell.win.webContents.send('bookmarks:panel', false);
   shell.win.webContents.send('berth:panel', true);
+}
+
+function openBookmarkOverlay(shell: Shell, anchor: BerthAnchor): void {
+  if (shell.win.isDestroyed()) return;
+  const view = ensureOverlayView(shell);
+  const prevKind = shell.berthOverlayOpen ? shell.overlayKind : null;
+  shell.overlayKind = 'bookmarks';
+  shell.berthOverlayAnchor = anchor;
+  shell.berthOverlayOpen = true;
+  shell.win.contentView.addChildView(view);
+  view.setBounds(overlayBounds(shell));
+  sendBerthOverlayInit(shell);
+  view.webContents.focus();
+  if (prevKind === 'berth') shell.win.webContents.send('berth:panel', false);
+  shell.win.webContents.send('bookmarks:panel', true);
 }
 
 function closeBerthOverlay(shell: Shell): void {
   if (!shell.berthOverlayOpen) return;
+  const kind = shell.overlayKind;
   shell.berthOverlayOpen = false;
   if (!shell.win.isDestroyed()) {
     if (shell.berthOverlay) shell.win.contentView.removeChildView(shell.berthOverlay);
-    shell.win.webContents.send('berth:panel', false);
+    shell.win.webContents.send(kind === 'bookmarks' ? 'bookmarks:panel' : 'berth:panel', false);
     shell.win.webContents.focus();
   }
 }
@@ -2011,7 +2212,7 @@ function registerIpc(): void {
   ipcMain.handle('berths:panel-toggle', (e, anchor: unknown): boolean => {
     const shell = uiOf(e.sender);
     if (!shell) return false;
-    if (shell.berthOverlayOpen) {
+    if (shell.berthOverlayOpen && shell.overlayKind === 'berth') {
       closeBerthOverlay(shell);
       return false;
     }
@@ -2199,6 +2400,71 @@ function registerIpc(): void {
     return switchTab(shell, String(tabId));
   });
 
+  ipcMain.handle('tabs:reorder', (e, orderedIds: unknown): boolean => {
+    const shell = uiOf(e.sender);
+    if (!shell || !Array.isArray(orderedIds)) return false;
+    return applyTabOrder(shell, orderedIds.map(String));
+  });
+
+  ipcMain.handle('bookmarks:toggle', (e): boolean => {
+    const shell = uiOf(e.sender);
+    if (!shell) return false;
+    return toggleBookmark(shell);
+  });
+
+  ipcMain.handle('bookmarks:remove', (_e, id: unknown): boolean => {
+    if (typeof id !== 'string') return false;
+    return removeBookmark(id);
+  });
+
+  ipcMain.handle('bookmarks:panel-toggle', (e, anchor: unknown): boolean => {
+    const shell = uiOf(e.sender);
+    if (!shell) return false;
+    if (shell.berthOverlayOpen && shell.overlayKind === 'bookmarks') {
+      closeBerthOverlay(shell);
+      return false;
+    }
+    const a = (anchor ?? {}) as Record<string, unknown>;
+    const n = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+    openBookmarkOverlay(shell, { x: n(a.x), y: n(a.y), w: n(a.w), h: n(a.h) });
+    return true;
+  });
+
+  ipcMain.handle('bookmarks:open', (e, url: unknown): boolean => {
+    const shell = shellByWebContents(e.sender);
+    if (!shell || typeof url !== 'string') return false;
+    const key = bookmarkKey(url);
+    if (!key || !bookmarks.some((b) => bookmarkKey(b.url) === key)) return false;
+    const wc = activeWc(shell);
+    if (!wc) return false;
+    safeLoad(wc, key);
+    closeBerthOverlay(shell);
+    return true;
+  });
+
+  ipcMain.handle('start:quick-sites', (e): QuickSite[] | null => {
+    if (!isStartSender(e.sender)) return null;
+    return quickSites.map((s) => ({ ...s }));
+  });
+
+  ipcMain.handle('start:quick-sites-save', (e, raw: unknown): QuickSite[] | null => {
+    if (!isStartSender(e.sender)) return null;
+    const parsed = sanitizeQuickSites(raw);
+    if (!parsed) return null;
+    quickSites = parsed;
+    saveQuickSitesNow();
+    notifyQuickSites();
+    return quickSites.map((s) => ({ ...s }));
+  });
+
+  ipcMain.handle('start:quick-sites-reset', (e): QuickSite[] | null => {
+    if (!isStartSender(e.sender)) return null;
+    quickSites = DEFAULT_QUICK_SITES.map((s) => ({ ...s }));
+    saveQuickSitesNow();
+    notifyQuickSites();
+    return quickSites.map((s) => ({ ...s }));
+  });
+
   ipcMain.handle('nav:action', (e, action: unknown): void => {
     const shell = uiOf(e.sender);
     if (!shell) return;
@@ -2342,7 +2608,45 @@ function menuSignature(): string {
     vault.initFailed,
     vault.entries.filter((e) => e.accountId === id).map((e) => [e.id, e.origin, e.label]),
     vault.never.filter((n) => n.accountId === id).length,
+    bookmarks.map((b) => [b.id, b.title, b.url]),
+    shell ? bookmarkKey(shellPageUrl(shell)) : '',
   ]);
+}
+
+function openBookmark(url: string): void {
+  const shell = focusedShell();
+  const wc = shell ? activeWc(shell) : null;
+  if (!wc || !bookmarkKey(url)) return;
+  safeLoad(wc, url);
+}
+
+function bookmarkMenu(): MenuItemConstructorOptions {
+  const shell = focusedShell();
+  const key = shell ? bookmarkKey(shellPageUrl(shell)) : '';
+  const marked = key !== '' && bookmarks.some((b) => bookmarkKey(b.url) === key);
+  const items: MenuItemConstructorOptions[] = [
+    {
+      label: marked ? '取消收藏此页' : '收藏此页',
+      accelerator: 'CmdOrCtrl+D',
+      enabled: key !== '',
+      click: () => {
+        const s = focusedShell();
+        if (s) toggleBookmark(s);
+      },
+    },
+    { type: 'separator' },
+  ];
+  if (bookmarks.length === 0) {
+    items.push({ label: '暂无收藏', enabled: false });
+  } else {
+    for (const b of bookmarks.slice(0, 30)) {
+      items.push({
+        label: (b.title || b.url).slice(0, 80),
+        click: () => openBookmark(b.url),
+      });
+    }
+  }
+  return { label: '收藏', submenu: items };
 }
 function refreshMenuIfNeeded(): void {
   const sig = menuSignature();
@@ -2422,6 +2726,7 @@ function buildMenu(): void {
         { label: '下一个标签页', accelerator: 'CmdOrCtrl+Shift+]', click: () => { const s = front(); if (s) cycleTab(s, 1); } },
       ],
     },
+    bookmarkMenu(),
     accountMenu(),
     passwordMenu(),
     {
@@ -2564,6 +2869,7 @@ function createShell(opts: CreateShellOpts): Shell {
     berthOverlay: null,
     berthOverlayOpen: false,
     berthOverlayAnchor: { x: 0, y: 0, w: 0, h: 0 },
+    overlayKind: 'berth',
     findbar: null,
     findbarOpen: false,
     findText: '',
@@ -2709,6 +3015,8 @@ if (!gotLock) {
     pruneCrashDumps();
 
     loadAccounts();
+    loadBookmarks();
+    loadQuickSites();
     loadBerths();
     // 上次异常退出 → 恢复横幅；正常退出 → 直接恢复上次会话（原行为）
     crashRecoveryPending = crashedLastRun && accounts.length > 0;
