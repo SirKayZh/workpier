@@ -23,6 +23,25 @@
 
 ---
 
+<p align="center">
+  <img src="docs/images/accounts-browsing.png" width="720" alt="Several accounts in the sidebar while a page stays open">
+</p>
+
+<p align="center">
+  <em>Several accounts stay in the sidebar. The page you are reading does not reload when you switch.</em>
+</p>
+
+<p align="center">
+  <img src="docs/images/new-tab-workspaces.png" width="360" alt="New tab and workspace list">&nbsp;
+  <img src="docs/images/edit-shortcuts.png" width="360" alt="Edit the sites on a new tab">
+</p>
+
+<p align="center">
+  <em>A new tab asks which site to sign in to (left). The shortcut sites can be renamed, reordered, or removed (right).</em>
+</p>
+
+---
+
 ## Why WorkPier?
 
 Opening a second Chrome profile, or a second browser, means another window and another place to look. WorkPier keeps those logins in one window. The account you are not looking at stays signed in.

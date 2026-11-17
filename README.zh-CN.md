@@ -23,6 +23,25 @@
 
 ---
 
+<p align="center">
+  <img src="docs/images/accounts-browsing.png" width="720" alt="侧边栏放着多个账号，网页照常打开">
+</p>
+
+<p align="center">
+  <em>多个账号待在侧边栏里。换账号时，正在看的页面不用重新加载。</em>
+</p>
+
+<p align="center">
+  <img src="docs/images/new-tab-workspaces.png" width="360" alt="新标签页和工作区列表">&nbsp;
+  <img src="docs/images/edit-shortcuts.png" width="360" alt="编辑新标签页上的常用网站">
+</p>
+
+<p align="center">
+  <em>新标签页先问要登录哪个网站（左）。常用网站可以改名、调顺序、删掉（右）。</em>
+</p>
+
+---
+
 ## 为什么用 WorkPier
 
 再开一个 Chrome 用户，或者再开一个浏览器，就是又一个窗口、又一个要来回找的地方。WorkPier 把这些登录放在同一个窗口里。你没在看的那个账号，仍然是登录着的。
