@@ -2,7 +2,7 @@
   "name": "workpier",
   "productName": "WorkPier",
   "version": "2.8.1",
-  "description": "网页工作台 — 多工作区聚合同类网页（云账号/iWiki/企微文档），每账号独立会话秒级切换",
+  "description": "同一个网站同时登录多个账号，侧边栏一点就切，不用退出重登。",
   "author": "SirKayZh",
   "main": "dist/main.js",
   "scripts": {
