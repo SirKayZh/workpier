@@ -24,7 +24,7 @@
 ---
 
 <p align="center">
-  <img src="docs/images/accounts-browsing.png" width="512" alt="侧边栏放着多个账号，网页照常打开">
+  <img src="docs/images/accounts-browsing.png" width="720" alt="侧边栏放着多个账号，网页照常打开">
 </p>
 
 <p align="center">
