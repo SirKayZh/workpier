@@ -97,6 +97,8 @@ xattr -cr /Applications/WorkPier.app
 
 已经装着旧版本的，启动大约 5 秒后会提示更新，也可以在「帮助 → 检查更新」里自己检查。
 
+每一版改了什么，写在 [更新记录](CHANGELOG.md)。[Releases](https://github.com/SirKayZh/workpier/releases) 页面上是同一份说明。
+
 ---
 
 ## 快捷键

@@ -97,6 +97,8 @@ xattr -cr /Applications/WorkPier.app
 
 People already on an older build get an update prompt about five seconds after launch, or from **Help → Check for Updates**.
 
+What changed in each release: [CHANGELOG.md](CHANGELOG.md). The same text is on the [Releases](https://github.com/SirKayZh/workpier/releases) page.
+
 ---
 
 ## Keyboard shortcuts
