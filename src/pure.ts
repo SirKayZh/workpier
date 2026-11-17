@@ -424,6 +424,80 @@ export function isNewerVersion(candidate: string, current: string): boolean {
   return false;
 }
 
+/**
+ * Chromium 从 104 起把 Cookie 的 Expires/Max-Age 封顶 400 天，再写更长会被截断。
+ * 会话 Cookie 改成持久 Cookie 时用这个上限。
+ */
+export const SESSION_COOKIE_TTL_SEC = 400 * 24 * 60 * 60;
+
+/**
+ * 旧版本把会话 Cookie 写成 30 天。升级后第一次见到该账号时，
+ * 剩余寿命落在这个窗口里的持久 Cookie 收编进续期名单，避免还按旧的 30 天掉线。
+ */
+export const LEGACY_SESSION_COOKIE_MAX_REMAIN_SEC = 31 * 24 * 60 * 60;
+
+/** 距上限不到一天就不再重写，避免每次启动都刷一遍已经够长的 Cookie。 */
+export const SESSION_COOKIE_RENEW_SLACK_SEC = 24 * 60 * 60;
+
+export interface LoginCookieStamp {
+  name: string;
+  domain?: string;
+  path?: string;
+  session?: boolean;
+  expirationDate?: number;
+}
+
+/** 同一枚 Cookie 的稳定键：域名、路径、名字。值变化不算另一枚。 */
+export function loginCookieKey(cookie: { domain?: string; path?: string; name: string }): string {
+  return `${cookie.domain ?? ''}\t${cookie.path ?? '/'}\t${cookie.name}`;
+}
+
+/**
+ * 这枚 Cookie 要不要把到期日推到 now + SESSION_COOKIE_TTL_SEC。
+ * - 会话 Cookie（不落盘）：要。退出应用就会丢登录态。
+ * - 已经在续期名单里：要。用过一次就继续往后滑。
+ * - adoptLegacy：升级前那批 30 天 Cookie，剩余寿命还在窗口内就收编一次。
+ * 网站自己写下的、寿命已经更长的 Cookie 不动。
+ */
+export function shouldExtendLoginCookie(
+  cookie: LoginCookieStamp,
+  managedKeys: ReadonlySet<string>,
+  nowSec: number,
+  adoptLegacy: boolean,
+): boolean {
+  if (!cookie.name || !cookie.domain) return false;
+  if (cookie.session) return true;
+  if (managedKeys.has(loginCookieKey(cookie))) return true;
+  if (!adoptLegacy || typeof cookie.expirationDate !== 'number') return false;
+  const remain = cookie.expirationDate - nowSec;
+  return remain > 0 && remain <= LEGACY_SESSION_COOKIE_MAX_REMAIN_SEC;
+}
+
+/** 到期日已经顶到浏览器上限附近时，不必再写一遍。 */
+export function loginCookieNeedsRewrite(cookie: LoginCookieStamp, nowSec: number): boolean {
+  if (cookie.session) return true;
+  if (typeof cookie.expirationDate !== 'number') return true;
+  return cookie.expirationDate < nowSec + SESSION_COOKIE_TTL_SEC - SESSION_COOKIE_RENEW_SLACK_SEC;
+}
+
+/** 读盘后的续期名单。账号 id 非法或键不是字符串就丢掉。 */
+export function sanitizePersistedCookieMap(raw: unknown): Record<string, string[]> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out: Record<string, string[]> = {};
+  for (const [id, keys] of Object.entries(raw as Record<string, unknown>)) {
+    if (!/^[\w-]{1,64}$/.test(id) || !Array.isArray(keys)) continue;
+    const list: string[] = [];
+    const seen = new Set<string>();
+    for (const key of keys) {
+      if (typeof key !== 'string' || key.length === 0 || key.length > 2048 || seen.has(key)) continue;
+      seen.add(key);
+      list.push(key);
+    }
+    out[id] = list;
+  }
+  return out;
+}
+
 /** 矩形（结构化最小定义，避免 pure.ts 依赖 electron 类型） */
 export interface Rect {
   x: number;

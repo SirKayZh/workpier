@@ -37,6 +37,11 @@ import {
   sanitizeBookmarks,
   sanitizeQuickSites,
   findbarAnchor,
+  SESSION_COOKIE_TTL_SEC,
+  loginCookieKey,
+  loginCookieNeedsRewrite,
+  shouldExtendLoginCookie,
+  sanitizePersistedCookieMap,
 } from './pure';
 import { vault } from './vaultClient';
 import { checkForUpdatesInteractive, checkForUpdatesOnLaunch, updateTokenFromArgv, reconcilePendingUpdate } from './updater';
@@ -927,37 +932,175 @@ function watchAccountIdentity(acc: Account, ses: Session): void {
 /* ---------- 会话 Cookie 持久化 ---------- */
 
 /**
- * 腾讯云等站点的登录 Cookie 是「会话 Cookie」（不落盘），应用一退出登录态就清零，
- * 每次重启/升级都要全部重新扫码/输密码。Electron 没有 Chromium 的
- * persist-session-cookies 开关，这里在应用层把账号分区里新增的会话 Cookie
- * 改写为带过期时间的持久 Cookie（默认 30 天），重启后登录态保留：
+ * 腾讯云等站点的登录 Cookie 是「会话 Cookie」（不落盘），应用一退出登录态就清零。
+ * Electron 没有 Chromium 的 persist-session-cookies 开关，这里把会话 Cookie
+ * 改写成持久 Cookie，到期日顶到浏览器上限（400 天）。已经接管的 Cookie
+ * 在每次打开、以及开着时每 12 小时，再把到期日往后推，使用期间不会因为本地到期掉线。
  * - 网站主动删除（removed=true）不拦截，登出行为不受影响；
- * - 改写后的持久 Cookie 再触发 changed 时 session=false，不会进入循环。
+ * - 改写后的持久 Cookie 再触发 changed 时 session=false，不会进入循环；
+ * - 服务器自己作废票据时，续本地 Cookie 无法代替重新登录。
  */
-const SESSION_COOKIE_TTL_SEC = 30 * 24 * 3600;
+const COOKIE_RENEW_INTERVAL_MS = 12 * 60 * 60 * 1000;
 const cookiePersistedSessions = new Set<string>();
+/** 账号 id → 已接管的 Cookie 键。文件里没有这个账号时，第一次扫描会收编旧的 30 天 Cookie。 */
+let managedLoginCookies = new Map<string, Set<string>>();
+let managedLoginCookiesLoaded = false;
+let managedLoginCookiesTimer: ReturnType<typeof setTimeout> | null = null;
+let cookieRenewTimer: ReturnType<typeof setInterval> | null = null;
+
+function persistedCookieFile(): string {
+  return path.join(app.getPath('userData'), 'login-cookies.json');
+}
+
+function loadManagedLoginCookies(): void {
+  if (managedLoginCookiesLoaded) return;
+  managedLoginCookiesLoaded = true;
+  try {
+    const map = sanitizePersistedCookieMap(JSON.parse(fs.readFileSync(persistedCookieFile(), 'utf-8')));
+    managedLoginCookies = new Map(Object.entries(map).map(([id, keys]) => [id, new Set(keys)]));
+  } catch {
+    managedLoginCookies = new Map();
+  }
+}
+
+function saveManagedLoginCookiesNow(): void {
+  if (!managedLoginCookiesLoaded) return;
+  try {
+    const file = persistedCookieFile();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const obj: Record<string, string[]> = {};
+    for (const [id, keys] of managedLoginCookies) obj[id] = [...keys];
+    writeFileAtomic(file, JSON.stringify(obj));
+  } catch (err) {
+    console.error('[workpier] save login cookies failed:', err);
+  }
+}
+
+function scheduleManagedLoginCookiesSave(): void {
+  if (managedLoginCookiesTimer) return;
+  managedLoginCookiesTimer = setTimeout(() => {
+    managedLoginCookiesTimer = null;
+    saveManagedLoginCookiesNow();
+  }, 500);
+}
+
+function flushManagedLoginCookies(): void {
+  if (managedLoginCookiesTimer) {
+    clearTimeout(managedLoginCookiesTimer);
+    managedLoginCookiesTimer = null;
+  }
+  saveManagedLoginCookiesNow();
+}
+
+function rememberLoginCookie(accountId: string, key: string): void {
+  loadManagedLoginCookies();
+  let keys = managedLoginCookies.get(accountId);
+  if (!keys) {
+    keys = new Set();
+    managedLoginCookies.set(accountId, keys);
+  }
+  if (keys.has(key)) return;
+  keys.add(key);
+  scheduleManagedLoginCookiesSave();
+}
+
+function dropManagedLoginCookies(accountId: string): void {
+  loadManagedLoginCookies();
+  if (!managedLoginCookies.delete(accountId)) return;
+  scheduleManagedLoginCookiesSave();
+}
+
+function stampLoginCookie(ses: Session, cookie: Electron.Cookie, nowSec: number): Promise<void> {
+  if (!cookie.domain) return Promise.resolve();
+  const host = cookie.domain.replace(/^\./, '');
+  const detail: Electron.CookiesSetDetails = {
+    url: `${cookie.secure ? 'https' : 'http'}://${host}${cookie.path}`,
+    name: cookie.name,
+    value: cookie.value,
+    path: cookie.path,
+    secure: cookie.secure,
+    httpOnly: cookie.httpOnly,
+    sameSite: cookie.sameSite,
+    expirationDate: nowSec + SESSION_COOKIE_TTL_SEC,
+    ...(cookie.hostOnly ? {} : { domain: cookie.domain }),
+  };
+  return ses.cookies.set(detail).then(() => undefined);
+}
+
+const cookieRenewInflight = new Map<string, Promise<void>>();
+
+/** 把该账号里该续的 Cookie 到期日推到上限，并记下名单。同一账号不并发重入。 */
+function renewPersistedCookies(accountId: string, ses: Session): Promise<void> {
+  const existing = cookieRenewInflight.get(accountId);
+  if (existing) return existing;
+  const job = renewPersistedCookiesNow(accountId, ses).finally(() => {
+    if (cookieRenewInflight.get(accountId) === job) cookieRenewInflight.delete(accountId);
+  });
+  cookieRenewInflight.set(accountId, job);
+  return job;
+}
+
+async function renewPersistedCookiesNow(accountId: string, ses: Session): Promise<void> {
+  loadManagedLoginCookies();
+  const adoptLegacy = !managedLoginCookies.has(accountId);
+  const managed = managedLoginCookies.get(accountId) ?? new Set<string>();
+  const before = new Set(managed);
+  let cookies: Electron.Cookie[] = [];
+  try {
+    cookies = await ses.cookies.get({});
+  } catch (err) {
+    console.error('[workpier] read cookies failed:', err);
+    return;
+  }
+  const nowSec = Math.floor(Date.now() / 1000);
+  const keep = new Set<string>();
+  for (const cookie of cookies) {
+    if (!shouldExtendLoginCookie(cookie, managed, nowSec, adoptLegacy)) continue;
+    const key = loginCookieKey(cookie);
+    keep.add(key);
+    if (!loginCookieNeedsRewrite(cookie, nowSec)) continue;
+    try {
+      await stampLoginCookie(ses, cookie, nowSec);
+    } catch {
+      /* 个别 cookie（非法 sameSite 等）改写失败：下次再试 */
+    }
+  }
+  // 扫描过程中新登录写进来的 Cookie 不在这次 get 的结果里，留在名单里，下次再续。
+  const during = managedLoginCookies.get(accountId);
+  if (during) {
+    for (const key of during) {
+      if (!before.has(key)) keep.add(key);
+    }
+  }
+  managedLoginCookies.set(accountId, keep);
+  scheduleManagedLoginCookiesSave();
+}
+
+function ensureCookieRenewTimer(): void {
+  if (cookieRenewTimer) return;
+  cookieRenewTimer = setInterval(() => {
+    for (const id of cookiePersistedSessions) {
+      void renewPersistedCookies(id, session.fromPartition(`persist:clouddock-${id}`));
+    }
+  }, COOKIE_RENEW_INTERVAL_MS);
+  cookieRenewTimer.unref?.();
+}
 
 function persistSessionCookies(acc: Account, ses: Session): void {
   if (cookiePersistedSessions.has(acc.id)) return;
   cookiePersistedSessions.add(acc.id);
+  ensureCookieRenewTimer();
   ses.cookies.on('changed', (_e, cookie, _cause, removed) => {
+    // 网站删掉 Cookie（登出）不拦。名单在下次续期时按还在的 Cookie 收口，这里不删键，
+    // 避免「改写成持久 Cookie」时浏览器先发 removed、把刚记下的登录 Cookie 划掉。
     if (removed || !cookie.session || !cookie.domain) return;
-    const host = cookie.domain.replace(/^\./, '');
-    const detail: Electron.CookiesSetDetails = {
-      url: `${cookie.secure ? 'https' : 'http'}://${host}${cookie.path}`,
-      name: cookie.name,
-      value: cookie.value,
-      path: cookie.path,
-      secure: cookie.secure,
-      httpOnly: cookie.httpOnly,
-      sameSite: cookie.sameSite,
-      expirationDate: Math.floor(Date.now() / 1000) + SESSION_COOKIE_TTL_SEC,
-      ...(cookie.hostOnly ? {} : { domain: cookie.domain }),
-    };
-    ses.cookies.set(detail).catch(() => {
+    rememberLoginCookie(acc.id, loginCookieKey(cookie));
+    const nowSec = Math.floor(Date.now() / 1000);
+    stampLoginCookie(ses, cookie, nowSec).catch(() => {
       /* 个别 cookie（非法 sameSite 等）改写失败：保持会话语义，不影响页面 */
     });
   });
+  void renewPersistedCookies(acc.id, ses);
 }
 
 /* ---------- 权限策略（session 级） ---------- */
@@ -1760,6 +1903,7 @@ async function removeAccount(shell: Shell, id: string): Promise<boolean> {
   clearTimeout(identityTimers.get(id));
   identityTimers.delete(id);
   cookiePersistedSessions.delete(id);
+  dropManagedLoginCookies(id);
 
   for (const s of aliveShells()) {
     if (s.activeId !== id) {
@@ -2776,6 +2920,7 @@ function buildMenu(): void {
 function preUpdateExit(): void {
   if (saveTimer) clearTimeout(saveTimer);
   saveAccountsNow();
+  flushManagedLoginCookies();
   try {
     fs.rmSync(runningFlagFile(), { force: true });
   } catch {
@@ -3051,6 +3196,7 @@ if (!gotLock) {
       uiSaveTimer = null;
     }
     saveAccountsNow(); // 内部含 saveUiNow：去抖中的 UI 状态在此 flush
+    flushManagedLoginCookies();
     // 正常退出：删运行标记（下次启动不做崩溃恢复）
     try {
       fs.rmSync(runningFlagFile(), { force: true });

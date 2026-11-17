@@ -15,6 +15,13 @@ import {
   sanitizeQuickSites,
   DEFAULT_QUICK_SITES,
   findbarAnchor,
+  LEGACY_SESSION_COOKIE_MAX_REMAIN_SEC,
+  loginCookieKey,
+  loginCookieNeedsRewrite,
+  sanitizePersistedCookieMap,
+  SESSION_COOKIE_RENEW_SLACK_SEC,
+  SESSION_COOKIE_TTL_SEC,
+  shouldExtendLoginCookie,
   resolveInput,
   sanitizeAccount,
   sanitizeBerth,
@@ -431,6 +438,66 @@ describe('收藏与快捷打开', () => {
     expect(kept).toEqual(DEFAULT_QUICK_SITES);
     expect(sanitizeQuickSites([])).toEqual([]);
     expect(sanitizeQuickSites({ name: 'x' })).toBeNull();
+  });
+
+  it('会话 Cookie 续到浏览器上限，旧的 30 天 Cookie 只在首次收编', () => {
+    const now = 1_700_000_000;
+    const sessionCookie = { name: 'skey', domain: '.cloud.tencent.com', path: '/', session: true };
+    const legacy = {
+      name: 'uin',
+      domain: '.cloud.tencent.com',
+      path: '/',
+      session: false,
+      expirationDate: now + 10 * 24 * 3600,
+    };
+    const longLived = {
+      name: 'sid',
+      domain: '.github.com',
+      path: '/',
+      session: false,
+      expirationDate: now + 200 * 24 * 3600,
+    };
+    const managed = new Set<string>();
+
+    expect(shouldExtendLoginCookie(sessionCookie, managed, now, false)).toBe(true);
+    expect(shouldExtendLoginCookie(legacy, managed, now, true)).toBe(true);
+    expect(shouldExtendLoginCookie(legacy, managed, now, false)).toBe(false);
+    expect(shouldExtendLoginCookie(longLived, managed, now, true)).toBe(false);
+    expect(legacy.expirationDate - now).toBeLessThanOrEqual(LEGACY_SESSION_COOKIE_MAX_REMAIN_SEC);
+
+    managed.add(loginCookieKey(legacy));
+    expect(shouldExtendLoginCookie(legacy, managed, now, false)).toBe(true);
+    expect(loginCookieKey(sessionCookie)).toBe('.cloud.tencent.com\t/\tskey');
+  });
+
+  it('到期日已经顶到上限附近时不再重写', () => {
+    const now = 1_700_000_000;
+    const fresh = {
+      name: 'skey',
+      domain: '.cloud.tencent.com',
+      path: '/',
+      session: false,
+      expirationDate: now + SESSION_COOKIE_TTL_SEC - SESSION_COOKIE_RENEW_SLACK_SEC,
+    };
+    const aging = {
+      ...fresh,
+      expirationDate: now + SESSION_COOKIE_TTL_SEC - SESSION_COOKIE_RENEW_SLACK_SEC - 1,
+    };
+    expect(loginCookieNeedsRewrite({ ...fresh, session: true }, now)).toBe(true);
+    expect(loginCookieNeedsRewrite(fresh, now)).toBe(false);
+    expect(loginCookieNeedsRewrite(aging, now)).toBe(true);
+    expect(SESSION_COOKIE_TTL_SEC).toBe(400 * 24 * 60 * 60);
+  });
+
+  it('续期名单：丢掉非法账号 id，键去重', () => {
+    expect(sanitizePersistedCookieMap(null)).toEqual({});
+    expect(sanitizePersistedCookieMap(['x'])).toEqual({});
+    expect(
+      sanitizePersistedCookieMap({
+        'abc-1': ['.a.com\t/\tskey', '.a.com\t/\tskey', '', 1],
+        '../etc': ['.a.com\t/\tskey'],
+      }),
+    ).toEqual({ 'abc-1': ['.a.com\t/\tskey'] });
   });
 
   it('快捷打开：去空名、去重、保留用户顺序', () => {
