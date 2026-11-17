@@ -24,7 +24,7 @@
 ---
 
 <p align="center">
-  <img src="docs/images/accounts-browsing.png" width="720" alt="Several accounts in the sidebar while a page stays open">
+  <img src="docs/images/accounts-browsing.png" width="512" alt="Several accounts in the sidebar while a page stays open">
 </p>
 
 <p align="center">
