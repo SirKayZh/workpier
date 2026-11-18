@@ -119,7 +119,9 @@ function dpapi(blob: Buffer, protect: boolean): Buffer | null {
     ).trim();
     const buf = Buffer.from(out, 'base64');
     return buf.length > 0 ? buf : null;
-  } catch {
+  } catch (err) {
+    const msg = err instanceof Error ? err.message.split('\n')[0] : String(err);
+    console.error('[workpier] dpapi failed:', msg);
     return null;
   }
 }
@@ -425,9 +427,11 @@ parentPort.on('message', (e) => {
   const req = (e as unknown as { data: VaultRequest }).data;
   try {
     const result = handle(req);
-    parentPort.postMessage({ id: req.id, result });
+    const replyId = typeof req.reqId === 'number' ? req.reqId : req.id;
+    parentPort.postMessage({ id: replyId, result });
   } catch (err) {
     console.error('[vault] op failed:', req.op, err);
-    parentPort.postMessage({ id: req.id, result: { error: String(err) } });
+    const replyId = typeof req.reqId === 'number' ? req.reqId : req.id;
+    parentPort.postMessage({ id: replyId, result: { error: String(err) } });
   }
 });

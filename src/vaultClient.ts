@@ -119,7 +119,7 @@ export class Vault {
       }
       const id = this.nextId++;
       this.pending.set(id, { resolve, reject });
-      this.child.postMessage({ id, op, ...payload });
+      this.child.postMessage({ ...payload, op, reqId: id });
       setTimeout(() => {
         if (this.pending.delete(id)) reject(new Error(`vault op timeout: ${op}`));
       }, timeoutMs).unref?.();

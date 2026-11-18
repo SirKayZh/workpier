@@ -66,7 +66,7 @@ Opening a second Chrome profile, or a second browser, means another window and a
 - Add an account with no form to fill. A new tab opens. Type an address, or pick a site you use often.
 - Sign in on the page the way you always do. WorkPier names the account from the login when it can. Rename it any time.
 - The same site can be signed in under different accounts. They do not overwrite each other.
-- `⌘1`–`⌘9` jumps to an account in the current workspace. On Windows, use the sidebar.
+- `⌘1`–`⌘9` (Ctrl+1–Ctrl+9 on Windows) jumps to an account in the current workspace. The sidebar click does the same thing.
 
 ### Tabs, windows, and the page you left
 
@@ -126,7 +126,7 @@ Menu shortcuts use `⌘` on macOS and `Ctrl` on Windows.
 
 | Action | macOS | Windows |
 | --- | --- | --- |
-| Switch account | ⌘1 – ⌘9 | Sidebar |
+| Switch account | ⌘1 – ⌘9 | Ctrl+1 – Ctrl+9 |
 | New tab | ⌘T | Ctrl+T |
 | Close tab | ⌘W | Ctrl+W |
 | New window | ⌘N | Ctrl+N |

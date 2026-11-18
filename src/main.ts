@@ -37,6 +37,9 @@ import {
   sanitizeBookmarks,
   sanitizeQuickSites,
   findbarAnchor,
+  accountHotkeyDigit,
+  chromeHotkey,
+  type ChromeHotkey,
   SESSION_COOKIE_TTL_SEC,
   loginCookieKey,
   loginCookieNeedsRewrite,
@@ -1336,25 +1339,8 @@ function createTabView(shell: Shell, acc: Account, tab: Tab, prewarm = false): W
     Menu.buildFromTemplate(items).popup({ window: shell.win, x: b.x + params.x, y: b.y + params.y });
   });
 
-  // ⌘1~⌘9 切换账号（仅当前工作区内的序号；其余按键交给应用菜单）
-  wc.on('before-input-event', (event, input) => {
-    if (input.type !== 'keyDown') return;
-    // 搜索栏打开期间，焦点回到网页后按 Esc 也要能关掉它（Chrome 行为）
-    if (shell.findbarOpen && input.key === 'Escape') {
-      event.preventDefault();
-      closeFindbar(shell);
-      return;
-    }
-    if (!input.meta) return;
-    const m = /^Digit([1-9])$/.exec(input.code);
-    if (m) {
-      const target = visibleAccounts(shell)[Number(m[1]) - 1];
-      if (target) {
-        event.preventDefault();
-        switchAccount(shell, target.id);
-      }
-    }
-  });
+  // ⌘1~⌘9 / Ctrl+1~9 切换账号（仅当前工作区内的序号；其余按键交给应用菜单）
+  wc.on('before-input-event', (event, input) => handleChromeKeys(shell, event, input));
 
   // findInPage 的匹配进度（当前第几个/共几个）实时转发给搜索栏
   wc.on('found-in-page', (_e, r) => {
@@ -2167,7 +2153,9 @@ function runFind(shell: Shell, text: string, forward: boolean, findNext: boolean
     sendFindMatches(shell, 0, 0);
     return;
   }
-  wc.findInPage(text, { forward, findNext, matchCase: false });
+  // Electron 44 把 findNext 定义成「true = 新开一轮」。调用方沿用 Chrome：
+  // false 是新搜索，true 才是下一处/上一处。这里对调后再交给 Chromium。
+  wc.findInPage(text, { forward, findNext: !findNext, matchCase: false });
 }
 
 function openFindbar(shell: Shell): void {
@@ -2191,6 +2179,99 @@ function openFindbar(shell: Shell): void {
   shell.findbar.setBounds(findbarAnchor(viewBounds(shell), FINDBAR_W, FINDBAR_H, FINDBAR_MARGIN));
   shell.findbar.webContents.send('findbar:init', { text: shell.findText });
   shell.findbar.webContents.focus();
+}
+
+/** 网页和窗口壳共用：Esc 关页内查找；⌘1–9 / Ctrl+1–9 切当前工作区的账号。 */
+function handleChromeKeys(shell: Shell, event: Electron.Event, input: Electron.Input): void {
+  if (input.type !== 'keyDown') return;
+  if (shell.findbarOpen && input.key === 'Escape') {
+    event.preventDefault();
+    closeFindbar(shell);
+    return;
+  }
+  if (input.isAutoRepeat) return;
+  const hot = chromeHotkey(input, process.platform);
+  if (hot) {
+    event.preventDefault();
+    runChromeHotkey(shell, hot);
+    return;
+  }
+  const n = accountHotkeyDigit(input, process.platform);
+  if (n == null) return;
+  const target = visibleAccounts(shell)[n - 1];
+  if (!target) return;
+  event.preventDefault();
+  switchAccount(shell, target.id);
+}
+
+function zoomActive(shell: Shell, delta: number): void {
+  const wc = activeWc(shell);
+  if (!wc || wc.isDestroyed()) return;
+  const next = delta === 0 ? 1 : Math.min(3, Math.max(0.5, wc.getZoomFactor() + delta));
+  wc.setZoomFactor(next);
+}
+
+function runChromeHotkey(shell: Shell, hot: ChromeHotkey): void {
+  switch (hot) {
+    case 'find':
+      if (shell.findbarOpen && shell.findbar) shell.findbar.webContents.focus();
+      else openFindbar(shell);
+      return;
+    case 'find-next':
+      findStep(shell, true);
+      return;
+    case 'find-prev':
+      findStep(shell, false);
+      return;
+    case 'new-window':
+      openNewWindow();
+      return;
+    case 'new-tab': {
+      const acc = activeAccount(shell) ?? visibleAccounts(shell)[0];
+      if (acc) newTabForAccount(shell, acc);
+      return;
+    }
+    case 'close-tab': {
+      const tab = activeTab(shell);
+      if (tab) closeTab(shell, tab.id);
+      return;
+    }
+    case 'prev-tab':
+      cycleTab(shell, -1);
+      return;
+    case 'next-tab':
+      cycleTab(shell, 1);
+      return;
+    case 'reload':
+      activeWc(shell)?.reload();
+      return;
+    case 'back':
+      activeWc(shell)?.goBack();
+      return;
+    case 'forward':
+      activeWc(shell)?.goForward();
+      return;
+    case 'sidebar':
+      setSidebarCollapsed(shell, !shell.sidebarCollapsed);
+      return;
+    case 'bookmark':
+      toggleBookmark(shell);
+      return;
+    case 'zoom-in':
+      zoomActive(shell, 0.1);
+      return;
+    case 'zoom-out':
+      zoomActive(shell, -0.1);
+      return;
+    case 'zoom-reset':
+      zoomActive(shell, 0);
+      return;
+    case 'devtools':
+      activeWc(shell)?.openDevTools({ mode: 'detach' });
+      return;
+    default:
+      return;
+  }
 }
 
 function closeFindbar(shell: Shell): void {
@@ -2803,10 +2884,7 @@ function buildMenu(): void {
   const front = (): Shell | null => focusedShell();
   const zoom = (delta: number): void => {
     const shell = front();
-    const wc = shell ? activeWc(shell) : null;
-    if (!wc) return;
-    const next = delta === 0 ? 1 : Math.min(3, Math.max(0.5, wc.getZoomFactor() + delta));
-    wc.setZoomFactor(next);
+    if (shell) zoomActive(shell, delta);
   };
   const template: MenuItemConstructorOptions[] = [
     { role: 'appMenu' },
@@ -3057,6 +3135,8 @@ function createShell(opts: CreateShellOpts): Shell {
   });
 
   win.webContents.on('will-navigate', (e) => e.preventDefault());
+  // 焦点在地址栏、侧边栏时按键不进网页，这里同样认账号快捷键
+  win.webContents.on('before-input-event', (event, input) => handleChromeKeys(shell, event, input));
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   win.webContents.on('did-finish-load', () => bootShell(shell));
   return shell;

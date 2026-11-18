@@ -510,6 +510,64 @@ export interface Rect {
  * 页内查找浮层的落位：网页区右上角、留 margin 间距；
  * 网页区过窄时宽度收缩并贴左（至少保留 margin）。
  */
+/**
+ * 切到当前工作区第几个账号。macOS 认 ⌘，Windows 认 Ctrl。
+ * 带 Alt、Shift，或按了另一边的修饰键（Windows 上的 Win、macOS 上的 Ctrl）时不认，避免和系统快捷键抢。
+ * 返回 1–9，不是这组快捷键时返回 null。
+ */
+export function accountHotkeyDigit(
+  input: { meta?: boolean; control?: boolean; alt?: boolean; shift?: boolean; code?: string },
+  platform: string,
+): number | null {
+  if (input.alt || input.shift) return null;
+  const ok = platform === 'darwin' ? !!input.meta && !input.control : !!input.control && !input.meta;
+  if (!ok) return null;
+  const m = /^Digit([1-9])$/.exec(input.code ?? '');
+  return m ? Number(m[1]) : null;
+}
+
+export type ChromeHotkey =
+  | 'find' | 'find-next' | 'find-prev'
+  | 'new-window' | 'new-tab' | 'close-tab' | 'prev-tab' | 'next-tab'
+  | 'reload' | 'back' | 'forward' | 'sidebar' | 'bookmark'
+  | 'zoom-in' | 'zoom-out' | 'zoom-reset' | 'devtools';
+
+/**
+ * 菜单上的快捷键。Windows 隐藏菜单栏、焦点又在网页里时，菜单收不到按键，要在页面自己认。
+ * macOS 认 ⌘，Windows 认 Ctrl。Win 键、或按了另一边的修饰键，不认。
+ */
+export function chromeHotkey(
+  input: { meta?: boolean; control?: boolean; alt?: boolean; shift?: boolean; code?: string },
+  platform: string,
+): ChromeHotkey | null {
+  const ok = platform === 'darwin' ? !!input.meta && !input.control : !!input.control && !input.meta;
+  if (!ok) return null;
+  const code = input.code ?? '';
+  if (input.alt) return !input.shift && code === 'KeyI' ? 'devtools' : null;
+  if (input.shift) {
+    if (code === 'KeyG') return 'find-prev';
+    if (code === 'BracketLeft') return 'prev-tab';
+    if (code === 'BracketRight') return 'next-tab';
+    return null;
+  }
+  switch (code) {
+    case 'KeyF': return 'find';
+    case 'KeyG': return 'find-next';
+    case 'KeyN': return 'new-window';
+    case 'KeyT': return 'new-tab';
+    case 'KeyW': return 'close-tab';
+    case 'KeyR': return 'reload';
+    case 'KeyB': return 'sidebar';
+    case 'KeyD': return 'bookmark';
+    case 'BracketLeft': return 'back';
+    case 'BracketRight': return 'forward';
+    case 'Equal': return 'zoom-in';
+    case 'Minus': return 'zoom-out';
+    case 'Digit0': return 'zoom-reset';
+    default: return null;
+  }
+}
+
 export function findbarAnchor(view: Rect, width: number, height: number, margin: number): Rect {
   const w = Math.max(0, Math.min(width, view.width - margin));
   return {

@@ -15,6 +15,8 @@ import {
   sanitizeQuickSites,
   DEFAULT_QUICK_SITES,
   findbarAnchor,
+  accountHotkeyDigit,
+  chromeHotkey,
   LEGACY_SESSION_COOKIE_MAX_REMAIN_SEC,
   loginCookieKey,
   loginCookieNeedsRewrite,
@@ -511,5 +513,42 @@ describe('收藏与快捷打开', () => {
     expect(list?.[0].url).toBe('https://docs.example.com/');
     expect(list?.[0].color).toBe(PALETTE[0]);
     expect(list?.[0].name).toBe('文档');
+  });
+});
+
+describe('accountHotkeyDigit', () => {
+  it('Windows 认 Ctrl+数字，不认 Win 键', () => {
+    expect(accountHotkeyDigit({ control: true, code: 'Digit1' }, 'win32')).toBe(1);
+    expect(accountHotkeyDigit({ control: true, code: 'Digit9' }, 'win32')).toBe(9);
+    expect(accountHotkeyDigit({ meta: true, code: 'Digit1' }, 'win32')).toBeNull();
+    expect(accountHotkeyDigit({ control: true, alt: true, code: 'Digit1' }, 'win32')).toBeNull();
+    expect(accountHotkeyDigit({ control: true, shift: true, code: 'Digit1' }, 'win32')).toBeNull();
+    expect(accountHotkeyDigit({ control: true, code: 'Numpad1' }, 'win32')).toBeNull();
+  });
+
+  it('macOS 认 ⌘数字，不认单独的 Ctrl', () => {
+    expect(accountHotkeyDigit({ meta: true, code: 'Digit3' }, 'darwin')).toBe(3);
+    expect(accountHotkeyDigit({ control: true, code: 'Digit1' }, 'darwin')).toBeNull();
+    expect(accountHotkeyDigit({ meta: true, control: true, code: 'Digit1' }, 'darwin')).toBeNull();
+  });
+});
+
+describe('chromeHotkey', () => {
+  it('Windows 的 Ctrl+F / Ctrl+N 打开查找和新窗口', () => {
+    expect(chromeHotkey({ control: true, code: 'KeyF' }, 'win32')).toBe('find');
+    expect(chromeHotkey({ control: true, code: 'KeyN' }, 'win32')).toBe('new-window');
+    expect(chromeHotkey({ control: true, code: 'KeyT' }, 'win32')).toBe('new-tab');
+    expect(chromeHotkey({ control: true, code: 'KeyW' }, 'win32')).toBe('close-tab');
+    expect(chromeHotkey({ control: true, shift: true, code: 'KeyG' }, 'win32')).toBe('find-prev');
+    expect(chromeHotkey({ control: true, alt: true, code: 'KeyI' }, 'win32')).toBe('devtools');
+    expect(chromeHotkey({ control: true, code: 'Digit0' }, 'win32')).toBe('zoom-reset');
+    expect(chromeHotkey({ meta: true, code: 'KeyF' }, 'win32')).toBeNull();
+    expect(chromeHotkey({ control: true, shift: true, code: 'KeyN' }, 'win32')).toBeNull();
+  });
+
+  it('macOS 认 ⌘F / ⌘N', () => {
+    expect(chromeHotkey({ meta: true, code: 'KeyF' }, 'darwin')).toBe('find');
+    expect(chromeHotkey({ meta: true, code: 'KeyN' }, 'darwin')).toBe('new-window');
+    expect(chromeHotkey({ control: true, code: 'KeyF' }, 'darwin')).toBeNull();
   });
 });

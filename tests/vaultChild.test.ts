@@ -68,7 +68,7 @@ async function loadVault(kcDir: string): Promise<{ ask: (op: string, extra?: Rec
         }
       };
       port.on('reply', h);
-      port.emit('message', { data: { id, op, ...extra } });
+      port.emit('message', { data: { ...extra, op, reqId: id } });
     });
   return { ask };
 }
@@ -109,6 +109,21 @@ describe('vaultChild（fake security 驱动，不碰真实钥匙串）', () => {
 
     const dec = await ask('decrypt', { accountId: 'acc-1', origin: 'https://a.com' });
     expect(dec.payload).toEqual({ fields: ['u1'], password: 'p@ss-檐' });
+  });
+
+  it('删除一条密码后，回执用请求号而不是条目号，菜单数据里不再有它', async () => {
+    const { ask } = await loadVault(kcDir);
+    await ask('init', { userDataDir: dir, accountIds: ['acc-1'] });
+    const save = await ask('save', {
+      accountId: 'acc-1',
+      origin: 'https://a.com',
+      label: 'alice',
+      login: { fields: ['alice'], password: 's3cret-pass' },
+    });
+    const entryId = save.meta.entries[0].id as string;
+    const removed = await ask('remove-entry', { id: entryId });
+    expect(removed.meta.entries).toEqual([]);
+    expect(readDisk(dir).entries).toHaveLength(0);
   });
 
   it('🔴 回归：init 传入不匹配的 accountIds 不得清空磁盘密文（accounts.json 损坏/重置场景）', async () => {
@@ -228,7 +243,7 @@ async function loadVaultWin(psDir: string): Promise<{ ask: (op: string, extra?: 
         }
       };
       port.on('reply', h);
-      port.emit('message', { data: { id, op, ...extra } });
+      port.emit('message', { data: { ...extra, op, reqId: id } });
     });
   return { ask };
 }
