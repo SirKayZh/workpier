@@ -17,6 +17,9 @@ import {
   findbarAnchor,
   accountHotkeyDigit,
   chromeHotkey,
+  isPasteShortcut,
+  permissionCheckGranted,
+  sessionPermissionAllowed,
   LEGACY_SESSION_COOKIE_MAX_REMAIN_SEC,
   loginCookieKey,
   loginCookieNeedsRewrite,
@@ -550,5 +553,31 @@ describe('chromeHotkey', () => {
     expect(chromeHotkey({ meta: true, code: 'KeyF' }, 'darwin')).toBe('find');
     expect(chromeHotkey({ meta: true, code: 'KeyN' }, 'darwin')).toBe('new-window');
     expect(chromeHotkey({ control: true, code: 'KeyF' }, 'darwin')).toBeNull();
+  });
+});
+
+describe('粘贴', () => {
+  it('macOS 认 ⌘V，不认单独的 Ctrl+V', () => {
+    expect(isPasteShortcut({ meta: true, code: 'KeyV', key: 'v' }, 'darwin')).toBe(true);
+    expect(isPasteShortcut({ control: true, code: 'KeyV', key: 'v' }, 'darwin')).toBe(false);
+    expect(isPasteShortcut({ meta: true, shift: true, code: 'KeyV', key: 'v' }, 'darwin')).toBe(false);
+    expect(isPasteShortcut({ meta: true, alt: true, code: 'KeyV', key: 'v' }, 'darwin')).toBe(false);
+  });
+
+  it('Windows 认 Ctrl+V 和 Shift+Insert', () => {
+    expect(isPasteShortcut({ control: true, code: 'KeyV', key: 'v' }, 'win32')).toBe(true);
+    expect(isPasteShortcut({ shift: true, code: 'Insert', key: 'Insert' }, 'win32')).toBe(true);
+    expect(isPasteShortcut({ meta: true, code: 'KeyV', key: 'v' }, 'win32')).toBe(false);
+  });
+
+  it('粘贴时放行剪贴板读取，平时不放行', () => {
+    expect(permissionCheckGranted('clipboard-read', true)).toBe(true);
+    expect(permissionCheckGranted('clipboard-read', false)).toBe(false);
+    expect(permissionCheckGranted('deprecated-sync-clipboard-read', false)).toBe(true);
+    expect(permissionCheckGranted('clipboard-sanitized-write', false)).toBe(true);
+    expect(permissionCheckGranted('media', true)).toBe(false);
+    expect(permissionCheckGranted('geolocation', false)).toBe(false);
+    expect(sessionPermissionAllowed('clipboard-read')).toBe(false);
+    expect(sessionPermissionAllowed('notifications')).toBe(true);
   });
 });

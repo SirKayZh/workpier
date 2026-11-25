@@ -382,6 +382,7 @@ function renderList() {
       window.api.accountMenu(acc.id);
     });
     item.addEventListener('contextmenu', (e) => {
+      if (e.target.closest && e.target.closest('input, textarea')) return;
       e.preventDefault();
       window.api.accountMenu(acc.id);
     });

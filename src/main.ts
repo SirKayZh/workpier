@@ -39,6 +39,9 @@ import {
   findbarAnchor,
   accountHotkeyDigit,
   chromeHotkey,
+  isPasteShortcut,
+  permissionCheckGranted,
+  sessionPermissionAllowed,
   type ChromeHotkey,
   SESSION_COOKIE_TTL_SEC,
   loginCookieKey,
@@ -1108,7 +1111,53 @@ function persistSessionCookies(acc: Account, ses: Session): void {
 
 /* ---------- 权限策略（session 级） ---------- */
 
+/** 按下粘贴键或点了「粘贴」之后的一小段时间，异步剪贴板读取才放行 */
+const PASTE_GESTURE_MS = 2000;
+const pasteGestureUntil = new Map<number, number>();
+
+function markPaste(wc: WebContents): void {
+  if (wc.isDestroyed()) return;
+  pasteGestureUntil.set(wc.id, Date.now() + PASTE_GESTURE_MS);
+}
+
+function hasPasteGesture(wc: WebContents | null): boolean {
+  if (!wc || wc.isDestroyed()) return false;
+  return (pasteGestureUntil.get(wc.id) ?? 0) >= Date.now();
+}
+
+function notePasteKey(wc: WebContents, input: Electron.Input): void {
+  if (input.type === 'keyDown' && isPasteShortcut(input, process.platform)) markPaste(wc);
+}
+
+/** 地址栏、查找栏、改名框的右键：撤销/复制/粘贴。只在输入框上弹出。 */
+function attachEditContextMenu(win: BrowserWindow, wc: WebContents): void {
+  wc.on('context-menu', (_e, params) => {
+    if (win.isDestroyed() || wc.isDestroyed() || !params.isEditable) return;
+    const items: MenuItemConstructorOptions[] = [
+      { label: '撤销', click: () => !wc.isDestroyed() && wc.undo() },
+      { label: '重做', click: () => !wc.isDestroyed() && wc.redo() },
+      { type: 'separator' },
+      { label: '剪切', enabled: params.editFlags.canCut, click: () => !wc.isDestroyed() && wc.cut() },
+      { label: '复制', enabled: params.editFlags.canCopy, click: () => !wc.isDestroyed() && wc.copy() },
+      {
+        label: '粘贴',
+        enabled: params.editFlags.canPaste,
+        click: () => {
+          if (wc.isDestroyed()) return;
+          markPaste(wc);
+          wc.paste();
+        },
+      },
+      { label: '全选', click: () => !wc.isDestroyed() && wc.selectAll() },
+    ];
+    Menu.buildFromTemplate(items).popup({ window: win });
+  });
+}
+
 function applyPermissionPolicy(ses: Session): void {
+  ses.setPermissionCheckHandler((wc, permission) => {
+    return permissionCheckGranted(permission, hasPasteGesture(wc));
+  });
   ses.setPermissionRequestHandler((wc, permission, callback) => {
     // 摄像头/麦克风：弹框确认。静默放行等于对全网无条件开放，风险过高。
     if (permission === 'media') {
@@ -1127,15 +1176,13 @@ function applyPermissionPolicy(ses: Session): void {
         .then((c) => callback(c.response === 0));
       return;
     }
-    // 注意：clipboard-read 不在白名单 —— 任意网页静默读剪贴板会泄露复制的密码/token，默认拒绝。
-    // （往剪贴板写内容是低风险的，保留 clipboard-sanitized-write。）
-    const allowed = new Set([
-      'clipboard-sanitized-write',
-      'notifications',
-      'fullscreen',
-      'pointerLock',
-    ]);
-    callback(allowed.has(permission));
+    // clipboard-read 只在刚粘贴时放行。网页不经粘贴来读，会把复制的密码/token 拿走。
+    // 往剪贴板写、以及粘贴瞬间的同步读取，见 sessionPermissionAllowed。
+    if (permission === 'clipboard-read') {
+      callback(hasPasteGesture(wc));
+      return;
+    }
+    callback(sessionPermissionAllowed(permission));
   });
 }
 
@@ -1306,7 +1353,15 @@ function createTabView(shell: Shell, acc: Account, tab: Tab, prewarm = false): W
         { type: 'separator' },
         { label: '剪切', enabled: params.editFlags.canCut, click: () => !wc.isDestroyed() && wc.cut() },
         { label: '复制', enabled: params.editFlags.canCopy, click: () => !wc.isDestroyed() && wc.copy() },
-        { label: '粘贴', enabled: params.editFlags.canPaste, click: () => !wc.isDestroyed() && wc.paste() },
+        {
+          label: '粘贴',
+          enabled: params.editFlags.canPaste,
+          click: () => {
+            if (wc.isDestroyed()) return;
+            markPaste(wc);
+            wc.paste();
+          },
+        },
         { label: '全选', click: () => !wc.isDestroyed() && wc.selectAll() },
         { type: 'separator' },
       );
@@ -1340,7 +1395,10 @@ function createTabView(shell: Shell, acc: Account, tab: Tab, prewarm = false): W
   });
 
   // ⌘1~⌘9 / Ctrl+1~9 切换账号（仅当前工作区内的序号；其余按键交给应用菜单）
-  wc.on('before-input-event', (event, input) => handleChromeKeys(shell, event, input));
+  wc.on('before-input-event', (event, input) => {
+    notePasteKey(wc, input);
+    handleChromeKeys(shell, event, input);
+  });
 
   // findInPage 的匹配进度（当前第几个/共几个）实时转发给搜索栏
   wc.on('found-in-page', (_e, r) => {
@@ -2079,6 +2137,8 @@ function ensureOverlayView(shell: Shell): WebContentsView {
   const wc = shell.berthOverlay.webContents;
   wc.on('will-navigate', (e) => e.preventDefault());
   wc.setWindowOpenHandler(() => ({ action: 'deny' }));
+  wc.on('before-input-event', (_event, input) => notePasteKey(wc, input));
+  attachEditContextMenu(shell.win, wc);
   void wc.loadFile(path.join(__dirname, '..', 'overlay.html'));
   return shell.berthOverlay;
 }
@@ -2172,6 +2232,8 @@ function openFindbar(shell: Shell): void {
     const wc = shell.findbar.webContents;
     wc.on('will-navigate', (e) => e.preventDefault());
     wc.setWindowOpenHandler(() => ({ action: 'deny' }));
+    wc.on('before-input-event', (_event, input) => notePasteKey(wc, input));
+    attachEditContextMenu(shell.win, wc);
     void wc.loadFile(path.join(__dirname, '..', 'findbar.html'));
   }
   shell.findbarOpen = true;
@@ -3136,7 +3198,11 @@ function createShell(opts: CreateShellOpts): Shell {
 
   win.webContents.on('will-navigate', (e) => e.preventDefault());
   // 焦点在地址栏、侧边栏时按键不进网页，这里同样认账号快捷键
-  win.webContents.on('before-input-event', (event, input) => handleChromeKeys(shell, event, input));
+  win.webContents.on('before-input-event', (event, input) => {
+    notePasteKey(win.webContents, input);
+    handleChromeKeys(shell, event, input);
+  });
+  attachEditContextMenu(win, win.webContents);
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   win.webContents.on('did-finish-load', () => bootShell(shell));
   return shell;

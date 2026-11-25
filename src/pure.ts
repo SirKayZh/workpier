@@ -568,6 +568,45 @@ export function chromeHotkey(
   }
 }
 
+/**
+ * 用户正在粘贴。macOS 认 ⌘V，Windows 认 Ctrl+V，另外认 Shift+Insert。
+ * 带 Alt，或同时按了另一边的修饰键，不算。
+ */
+export function isPasteShortcut(
+  input: { meta?: boolean; control?: boolean; alt?: boolean; shift?: boolean; key?: string; code?: string },
+  platform: string,
+): boolean {
+  if (input.alt) return false;
+  const code = input.code ?? '';
+  const key = (input.key ?? '').toLowerCase();
+  if (input.shift && !input.meta && !input.control && (code === 'Insert' || key === 'insert')) return true;
+  const ok = platform === 'darwin' ? !!input.meta && !input.control : !!input.control && !input.meta;
+  if (!ok || input.shift) return false;
+  return code === 'KeyV' || key === 'v';
+}
+
+/** 会话里默许的权限。clipboard-read 不在这里：那会让网页不经粘贴就读剪贴板。 */
+export function sessionPermissionAllowed(permission: string): boolean {
+  return (
+    permission === 'clipboard-sanitized-write' ||
+    permission === 'deprecated-sync-clipboard-read' ||
+    permission === 'notifications' ||
+    permission === 'fullscreen' ||
+    permission === 'pointerLock'
+  );
+}
+
+/**
+ * 权限检查。粘贴要能同步读到剪贴板，别的应用里复制的字才会进输入框。
+ * clipboard-read 只在刚按下粘贴时放行，避免网页在后台把剪贴板读走。
+ * 摄像头/麦克风返回 false，交给请求处理弹框确认。
+ */
+export function permissionCheckGranted(permission: string, pasteGesture: boolean): boolean {
+  if (permission === 'clipboard-read') return pasteGesture;
+  if (permission === 'media') return false;
+  return sessionPermissionAllowed(permission);
+}
+
 export function findbarAnchor(view: Rect, width: number, height: number, margin: number): Rect {
   const w = Math.max(0, Math.min(width, view.width - margin));
   return {
